@@ -1,9 +1,18 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import asyncpg
 
 app = FastAPI(title="Valbura Portfolio API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 async def get_conn():
     db_url = os.getenv("DATABASE_URL")
