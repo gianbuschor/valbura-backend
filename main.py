@@ -340,26 +340,32 @@ async def fetch_ibkr_flex_report(query_id: str):
             "q": query_id,
             "v": "3",
         }
+
         send_resp = await client.get(send_url, params=send_params)
-        send_text = send_resp.text
+        send_text = send_resp.text.strip()
 
-        root = ET.fromstring(send_text)
-        status = root.findtext(".//Status")
+        try:
+            root = ET.fromstring(send_text)
+        except Exception as e:
+            raise RuntimeError(
+                f"IBKR SendRequest response is not XML: {str(e)} | response_start={send_text[:500]}"
+            )
+
+        status = None
+        ref_code = None
+
+        for elem in root.iter():
+            tag = elem.tag.lower()
+            if tag.endswith("status"):
+                status = elem.text
+            if tag.endswith("referencecode"):
+                ref_code = elem.text
+
         if status and status.lower() != "success":
-            raise RuntimeError(f"IBKR SendRequest failed: {send_text}")
-
-        ref_code = root.findtext(".//ReferenceCode")
-        if not ref_code:
-            ref_code = root.findtext(".//ReferenceCode".lower())
-        if not ref_code:
-            # Some IBKR responses use lowercase/other naming
-            for elem in root.iter():
-                if elem.tag.lower().endswith("referencecode"):
-                    ref_code = elem.text
-                    break
+            raise RuntimeError(f"IBKR SendRequest failed: {send_text[:1000]}")
 
         if not ref_code:
-            raise RuntimeError(f"IBKR ReferenceCode missing: {send_text}")
+            raise RuntimeError(f"IBKR ReferenceCode missing: {send_text[:1000]}")
 
         fetch_url = "https://gdcdyn.interactivebrokers.com/Universal/FlexStatementService.GetStatement"
         fetch_params = {
@@ -367,8 +373,14 @@ async def fetch_ibkr_flex_report(query_id: str):
             "q": ref_code,
             "v": "3",
         }
+
         fetch_resp = await client.get(fetch_url, params=fetch_params)
-        return fetch_resp.text
+        fetch_text = fetch_resp.text.strip()
+
+        if not fetch_text:
+            raise RuntimeError("IBKR GetStatement returned empty response")
+
+        return fetch_text
 
 
 def detect_ibkr_asset_class(asset_category: str):
