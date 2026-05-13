@@ -594,13 +594,13 @@ async def upsert_bitget_rows(conn, portfolio_name: str, rows: list, product_type
         rows_seen += 1
 
         raw_trade_id = (
-    row.get("tradeId")
-    or row.get("fillId")
-    or row.get("orderId")
-    or f"{product_type}-{rows_seen}-{row.get('cTime','')}"
-)
+            row.get("tradeId")
+            or row.get("fillId")
+            or row.get("orderId")
+            or f"{product_type}-{rows_seen}-{row.get('cTime','')}"
+        )
 
-trade_id = f"{portfolio_name}:{raw_trade_id}"
+        trade_id = f"{portfolio_name}:{raw_trade_id}"
         symbol = row.get("symbol") or row.get("instId") or "UNKNOWN"
         side = bitget_side_to_side(row)
         quantity = parse_decimal(row.get("baseVolume") or row.get("size") or row.get("qty"))
