@@ -8,6 +8,8 @@ import hmac
 import base64
 import hashlib
 import xml.etree.ElementTree as ET
+import csv
+import io
 from datetime import datetime, timezone, timedelta, date
 from decimal import Decimal
 from uuid import UUID
@@ -398,39 +400,149 @@ def detect_ibkr_asset_class(asset_category: str):
     return asset_category
 
 
-async def upsert_ibkr_trades(conn, portfolio_name: str, xml_text: str):
+async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
     portfolio_id = await get_portfolio_id(conn, portfolio_name)
-    root = ET.fromstring(xml_text)
 
     rows_seen = 0
     rows_inserted = 0
 
-    # IBKR Flex XML commonly contains <Trade ... /> entries.
-    for elem in root.iter():
-        if elem.tag.lower().endswith("trade"):
-            data = elem.attrib
+    report_text_stripped = report_text.strip()
+
+    # -------------------------------------------------
+    # CASE 1: XML Flex Report
+    # -------------------------------------------------
+    if report_text_stripped.startswith("<"):
+        try:
+            root = ET.fromstring(report_text)
+        except Exception:
+            root = None
+
+        if root is not None:
+            for elem in root.iter():
+                if elem.tag.lower().endswith("trade"):
+                    data = elem.attrib
+                    rows_seen += 1
+
+                    trade_id = (
+                        data.get("tradeID")
+                        or data.get("tradeId")
+                        or data.get("ibExecID")
+                        or data.get("execID")
+                        or data.get("transactionID")
+                    )
+
+                    if not trade_id:
+                        trade_id = f"ibkr-{portfolio_name}-{rows_seen}-{data.get('symbol','')}-{data.get('dateTime','')}"
+
+                    trade_id = f"{portfolio_name}:{trade_id}"
+
+                    symbol = data.get("symbol") or data.get("description") or "UNKNOWN"
+                    side = normalize_side(data.get("buySell") or data.get("side"))
+                    quantity = abs(parse_decimal(data.get("quantity")))
+                    price = parse_decimal(data.get("tradePrice") or data.get("price"))
+                    currency = data.get("currency") or "USD"
+                    asset_class = detect_ibkr_asset_class(data.get("assetCategory"))
+                    commission = parse_decimal(data.get("ibCommission"), 0)
+                    trade_time = parse_dt(data.get("dateTime") or data.get("tradeDate"))
+
+                    result = await conn.execute(
+                        """
+                        INSERT INTO public.trades (
+                            portfolio_id, broker, symbol, asset_class, instrument_type,
+                            side, quantity, price, currency, fee, trade_date,
+                            execution_time, external_trade_id, raw_payload
+                        )
+                        VALUES (
+                            $1, 'IBKR', $2, $3, $4,
+                            $5, $6, $7, $8, $9, $10,
+                            $10, $11, $12::jsonb
+                        )
+                        ON CONFLICT (broker, external_trade_id)
+                        DO UPDATE SET
+                            portfolio_id = EXCLUDED.portfolio_id,
+                            symbol = EXCLUDED.symbol,
+                            asset_class = EXCLUDED.asset_class,
+                            instrument_type = EXCLUDED.instrument_type,
+                            side = EXCLUDED.side,
+                            quantity = EXCLUDED.quantity,
+                            price = EXCLUDED.price,
+                            currency = EXCLUDED.currency,
+                            fee = EXCLUDED.fee,
+                            trade_date = EXCLUDED.trade_date,
+                            execution_time = EXCLUDED.execution_time,
+                            raw_payload = EXCLUDED.raw_payload,
+                            imported_at = now()
+                        """,
+                        portfolio_id,
+                        symbol,
+                        asset_class,
+                        data.get("assetCategory") or asset_class,
+                        side,
+                        quantity,
+                        price,
+                        currency,
+                        commission,
+                        trade_time,
+                        trade_id,
+                        json.dumps(data),
+                    )
+
+                    if result == "INSERT 0 1":
+                        rows_inserted += 1
+
+            return {
+                "rows_seen": rows_seen,
+                "rows_inserted": rows_inserted,
+                "portfolio": portfolio_name,
+                "format": "xml",
+            }
+
+    # -------------------------------------------------
+    # CASE 2: CSV Flex Report / Activity Statement fallback
+    # -------------------------------------------------
+    reader = csv.reader(io.StringIO(report_text))
+
+    for row in reader:
+        if not row:
+            continue
+
+        # IBKR Activity Statement CSV trade rows usually look like:
+        # Trades,Data,Order,Stocks,USD,AAPL,"2026-...",Quantity,Price,...
+        if len(row) > 11 and row[0] == "Trades" and row[1] == "Data":
             rows_seen += 1
 
-            trade_id = (
-                data.get("tradeID")
-                or data.get("tradeId")
-                or data.get("ibExecID")
-                or data.get("execID")
-                or data.get("transactionID")
-            )
-            if not trade_id:
-                trade_id = f"ibkr-{portfolio_name}-{rows_seen}-{data.get('symbol','')}-{data.get('dateTime','')}"
+            try:
+                asset_class = row[3]
+                currency = row[4]
+                symbol = row[5]
+                trade_time_raw = row[6]
+                quantity_raw = row[7]
+                price_raw = row[8]
+                commission_raw = row[11]
+            except Exception:
+                continue
 
-            trade_id = f"{portfolio_name}:{trade_id}"
+            quantity_signed = parse_decimal(quantity_raw)
+            quantity = abs(quantity_signed)
+            side = "BUY" if quantity_signed > 0 else "SELL"
+            price = parse_decimal(price_raw)
+            commission = parse_decimal(commission_raw, 0)
+            trade_time = parse_dt(trade_time_raw.replace(",", ""))
 
-            symbol = data.get("symbol") or data.get("description") or "UNKNOWN"
-            side = normalize_side(data.get("buySell") or data.get("side"))
-            quantity = abs(parse_decimal(data.get("quantity")))
-            price = parse_decimal(data.get("tradePrice") or data.get("price"))
-            currency = data.get("currency") or data.get("fxRateToBaseCurrency") or "USD"
-            asset_class = detect_ibkr_asset_class(data.get("assetCategory"))
-            commission = parse_decimal(data.get("ibCommission"), 0)
-            trade_time = parse_dt(data.get("dateTime") or data.get("tradeDate"))
+            raw_trade_id = f"{symbol}-{trade_time_raw}-{quantity_raw}-{price_raw}-{rows_seen}"
+            trade_id = f"{portfolio_name}:{raw_trade_id}"
+
+            data = {
+                "source": "ibkr_csv",
+                "asset_class": asset_class,
+                "currency": currency,
+                "symbol": symbol,
+                "trade_time": trade_time_raw,
+                "quantity": quantity_raw,
+                "price": price_raw,
+                "commission": commission_raw,
+                "row": row,
+            }
 
             result = await conn.execute(
                 """
@@ -463,7 +575,7 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, xml_text: str):
                 portfolio_id,
                 symbol,
                 asset_class,
-                data.get("assetCategory") or asset_class,
+                asset_class,
                 side,
                 quantity,
                 price,
@@ -473,6 +585,7 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, xml_text: str):
                 trade_id,
                 json.dumps(data),
             )
+
             if result == "INSERT 0 1":
                 rows_inserted += 1
 
@@ -480,6 +593,7 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, xml_text: str):
         "rows_seen": rows_seen,
         "rows_inserted": rows_inserted,
         "portfolio": portfolio_name,
+        "format": "csv",
     }
 
 
