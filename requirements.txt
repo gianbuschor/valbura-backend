@@ -1,3 +1,5 @@
 fastapi
 uvicorn[standard]
 asyncpg
+httpx
+python-dateutil
