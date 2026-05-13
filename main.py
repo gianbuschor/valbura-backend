@@ -401,6 +401,8 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, xml_text: str):
             if not trade_id:
                 trade_id = f"ibkr-{portfolio_name}-{rows_seen}-{data.get('symbol','')}-{data.get('dateTime','')}"
 
+            trade_id = f"{portfolio_name}:{trade_id}"
+
             symbol = data.get("symbol") or data.get("description") or "UNKNOWN"
             side = normalize_side(data.get("buySell") or data.get("side"))
             quantity = abs(parse_decimal(data.get("quantity")))
