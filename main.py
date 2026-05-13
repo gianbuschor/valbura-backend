@@ -8,7 +8,9 @@ import hmac
 import base64
 import hashlib
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
+from decimal import Decimal
+from uuid import UUID
 from typing import Optional, Any
 
 import asyncpg
@@ -44,6 +46,12 @@ def json_safe(value: Any):
         return {k: json_safe(v) for k, v in value.items()}
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, UUID):
+        return str(value)
     return value
 
 
