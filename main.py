@@ -10,6 +10,7 @@ import hashlib
 import xml.etree.ElementTree as ET
 import csv
 import io
+import asyncio
 from datetime import datetime, timezone, timedelta, date
 from decimal import Decimal
 from uuid import UUID
@@ -335,8 +336,13 @@ async def fetch_ibkr_flex_report(query_id: str):
     if not token:
         raise RuntimeError("IBKR_FLEX_TOKEN missing")
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        send_url = "https://gdcdyn.interactivebrokers.com/Universal/FlexStatementService.SendRequest"
+    base_url = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
+    headers = {
+        "User-Agent": "ValburaPortfolioImporter/1.0"
+    }
+
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True, headers=headers) as client:
+        send_url = f"{base_url}/SendRequest"
         send_params = {
             "t": token,
             "q": query_id,
@@ -350,26 +356,40 @@ async def fetch_ibkr_flex_report(query_id: str):
             root = ET.fromstring(send_text)
         except Exception as e:
             raise RuntimeError(
-                f"IBKR SendRequest response is not XML: {str(e)} | response_start={send_text[:500]}"
+                f"IBKR SendRequest response is not XML: {str(e)} | "
+                f"http_status={send_resp.status_code} | response_start={send_text[:500]}"
             )
 
         status = None
         ref_code = None
+        error_code = None
+        error_message = None
 
         for elem in root.iter():
             tag = elem.tag.lower()
             if tag.endswith("status"):
                 status = elem.text
-            if tag.endswith("referencecode"):
+            elif tag.endswith("referencecode"):
                 ref_code = elem.text
+            elif tag.endswith("errorcode"):
+                error_code = elem.text
+            elif tag.endswith("errormessage"):
+                error_message = elem.text
 
         if status and status.lower() != "success":
-            raise RuntimeError(f"IBKR SendRequest failed: {send_text[:1000]}")
+            raise RuntimeError(
+                f"IBKR SendRequest failed: status={status}, "
+                f"error_code={error_code}, error_message={error_message}, "
+                f"response_start={send_text[:1000]}"
+            )
 
         if not ref_code:
             raise RuntimeError(f"IBKR ReferenceCode missing: {send_text[:1000]}")
 
-        fetch_url = "https://gdcdyn.interactivebrokers.com/Universal/FlexStatementService.GetStatement"
+        # IBKR sometimes needs a short delay before report retrieval.
+        await asyncio.sleep(20)
+
+        fetch_url = f"{base_url}/GetStatement"
         fetch_params = {
             "t": token,
             "q": ref_code,
