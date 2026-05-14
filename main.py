@@ -35,6 +35,17 @@ app.add_middleware(
 # Helpers
 # -------------------------
 
+def require_admin_token(x_admin_token: Optional[str]):
+    expected_token = os.getenv("SYNC_ADMIN_TOKEN")
+
+    # If no token is configured, allow syncs.
+    # This keeps local/testing deployments from breaking.
+    if not expected_token:
+        return
+
+    if x_admin_token != expected_token:
+        raise PermissionError("Unauthorized")
+
 async def get_conn():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
@@ -622,7 +633,11 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
 
 
 @app.post("/sync/ibkr")
-async def sync_ibkr():
+async def sync_ibkr(x_admin_token: Optional[str] = Header(None)):
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
     conn = await get_conn()
     job_id = None
     try:
@@ -825,7 +840,11 @@ async def upsert_bitget_rows(conn, portfolio_name: str, rows: list, product_type
 
 
 @app.post("/sync/bitget")
-async def sync_bitget():
+async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
     conn = await get_conn()
     job_id = None
 
