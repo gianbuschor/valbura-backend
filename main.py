@@ -39,7 +39,11 @@ async def get_conn():
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         raise RuntimeError("DATABASE_URL is not set")
-    return await asyncpg.connect(db_url)
+
+    return await asyncpg.connect(
+        db_url,
+        statement_cache_size=0,
+    )
 
 
 def json_safe(value: Any):
