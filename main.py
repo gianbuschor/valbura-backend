@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -632,24 +632,19 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
     }
 
 
-@app.post("/sync/ibkr")
-async def sync_ibkr(x_admin_token: Optional[str] = Header(None)):
-    try:
-        require_admin_token(x_admin_token)
-    except PermissionError:
-        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+async def run_ibkr_sync_job():
     conn = await get_conn()
     job_id = None
+    total_seen = 0
+    total_inserted = 0
+    results = []
+
     try:
         global_query = os.getenv("IBKR_ACTIVITY_QUERY_ID_GLOBAL")
         alternatives_query = os.getenv("IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES") or global_query
 
         if not global_query:
             raise RuntimeError("IBKR_ACTIVITY_QUERY_ID_GLOBAL missing")
-
-        total_seen = 0
-        total_inserted = 0
-        results = []
 
         for portfolio_name, query_id in [
             ("Global", global_query),
@@ -678,22 +673,58 @@ async def sync_ibkr(x_admin_token: Optional[str] = Header(None)):
             total_inserted += result["rows_inserted"]
             results.append(result)
 
-        return JSONResponse(
-            content={
-                "status": "success",
-                "broker": "IBKR",
-                "rows_seen": total_seen,
-                "rows_inserted": total_inserted,
-                "results": results,
-            }
-        )
+        return {
+            "status": "success",
+            "broker": "IBKR",
+            "rows_seen": total_seen,
+            "rows_inserted": total_inserted,
+            "results": results,
+        }
+
     except Exception as e:
         if job_id:
             await finish_import_job(conn, job_id, "failed", error_message=str(e))
         await log_sync_error(conn, "IBKR", None, str(e))
-        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+        return {
+            "status": "failed",
+            "broker": "IBKR",
+            "error": str(e),
+        }
+
     finally:
         await conn.close()
+
+
+@app.post("/sync/ibkr")
+async def sync_ibkr(x_admin_token: Optional[str] = Header(None)):
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    result = await run_ibkr_sync_job()
+
+    status_code = 200 if result.get("status") == "success" else 500
+    return JSONResponse(content=result, status_code=status_code)
+
+
+@app.post("/sync/ibkr/trigger")
+async def trigger_ibkr(background_tasks: BackgroundTasks, x_admin_token: Optional[str] = Header(None)):
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    background_tasks.add_task(run_ibkr_sync_job)
+
+    return JSONResponse(
+        content={
+            "status": "accepted",
+            "broker": "IBKR",
+            "message": "IBKR sync started in background",
+        },
+        status_code=202,
+    )
 
 
 # -------------------------
