@@ -282,6 +282,21 @@ async def get_sync_status():
     finally:
         await conn.close()
 
+@app.get("/public/broker-accounts")
+async def get_broker_accounts():
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT broker, portfolio_name, account_name, account_identifier,
+                   source_key, base_currency, sync_enabled, is_active, updated_at
+            FROM public.v_broker_accounts_public
+            ORDER BY broker, portfolio_name, account_name
+            """
+        )
+        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+    finally:
+        await conn.close()
 
 @app.get("/public/positions")
 async def get_positions(portfolio: Optional[str] = None):
