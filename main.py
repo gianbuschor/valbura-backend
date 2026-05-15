@@ -351,6 +351,32 @@ async def get_nav(portfolio: Optional[str] = None):
     finally:
         await conn.close()
 
+@app.get("/public/portfolio-summary")
+async def get_portfolio_summary(portfolio: Optional[str] = None):
+    conn = await get_conn()
+    try:
+        if portfolio:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.v_public_portfolio_summary
+                WHERE portfolio_name = $1
+                """,
+                portfolio,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.v_public_portfolio_summary
+                ORDER BY portfolio_name
+                """
+            )
+
+        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+    finally:
+        await conn.close()
+
 
 @app.get("/health")
 async def health():
