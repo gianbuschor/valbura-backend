@@ -460,6 +460,48 @@ async def fetch_ibkr_flex_report(query_id: str):
 
         return fetch_text
 
+@app.post("/debug/ibkr/tags")
+async def debug_ibkr_tags(x_admin_token: Optional[str] = Header(None)):
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    query_id = os.getenv("IBKR_ACTIVITY_QUERY_ID_GLOBAL")
+    if not query_id:
+        return JSONResponse(content={"error": "IBKR_ACTIVITY_QUERY_ID_GLOBAL missing"}, status_code=500)
+
+    try:
+        xml_text = await fetch_ibkr_flex_report(query_id)
+        root = ET.fromstring(xml_text)
+
+        tag_counts = {}
+        sample_attrs = {}
+
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1]
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+            if tag not in sample_attrs and elem.attrib:
+                safe_attrs = {}
+                for key, value in elem.attrib.items():
+                    if key.lower() in ["accountid", "accountnumber", "acctid"]:
+                        safe_attrs[key] = "***"
+                    else:
+                        safe_attrs[key] = value
+                sample_attrs[tag] = safe_attrs
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "tag_counts": tag_counts,
+                "sample_attrs": sample_attrs,
+            }
+        )
+
+    except Exception as e:
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+
 
 def detect_ibkr_asset_class(asset_category: str):
     if not asset_category:
