@@ -629,6 +629,194 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
                 "format": "xml",
             }
 
+  async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text: str):
+    portfolio_id = await get_portfolio_id(conn, portfolio_name)
+
+    report_text_stripped = xml_text.strip()
+    if not report_text_stripped.startswith("<"):
+        return {
+            "portfolio": portfolio_name,
+            "snapshot_imported": False,
+            "reason": "IBKR report is not XML",
+        }
+
+    root = ET.fromstring(xml_text)
+
+    latest_equity = None
+    latest_report_date = None
+
+    for elem in root.iter():
+        if elem.tag.lower().endswith("equitysummarybyreportdateinbase"):
+            data = elem.attrib
+            report_date = data.get("reportDate")
+
+            if report_date and (latest_report_date is None or report_date > latest_report_date):
+                latest_report_date = report_date
+                latest_equity = data
+
+    if not latest_equity:
+        return {
+            "portfolio": portfolio_name,
+            "snapshot_imported": False,
+            "reason": "No EquitySummaryByReportDateInBase found",
+        }
+
+    snapshot_date = parse_dt(latest_report_date).date()
+    currency = latest_equity.get("currency") or "CHF"
+
+    nav = parse_decimal(latest_equity.get("total"), 0)
+    cash = parse_decimal(latest_equity.get("cash"), 0)
+
+    # IBKR reports some unrealized components separately.
+    # We use these as open PnL approximation in base currency.
+    cfd_unrealized = parse_decimal(latest_equity.get("cfdUnrealizedPl"), 0)
+    forex_cfd_unrealized = parse_decimal(latest_equity.get("forexCfdUnrealizedPl"), 0)
+    open_pnl = cfd_unrealized + forex_cfd_unrealized
+
+    market_value = nav - cash
+
+    await conn.execute(
+        """
+        INSERT INTO public.portfolio_nav_snapshots (
+            portfolio_id, broker, snapshot_date, currency,
+            nav, cash, market_value, open_pnl, closed_pnl,
+            deposits_withdrawals, source
+        )
+        VALUES (
+            $1, 'IBKR', $2, $3,
+            $4, $5, $6, $7, NULL,
+            NULL, 'ibkr_flex_equity_summary'
+        )
+        ON CONFLICT (portfolio_id, broker, snapshot_date, currency)
+        DO UPDATE SET
+            nav = EXCLUDED.nav,
+            cash = EXCLUDED.cash,
+            market_value = EXCLUDED.market_value,
+            open_pnl = EXCLUDED.open_pnl,
+            source = EXCLUDED.source,
+            created_at = now()
+        """,
+        portfolio_id,
+        snapshot_date,
+        currency,
+        nav,
+        cash,
+        market_value,
+        open_pnl,
+    )
+
+    await conn.execute(
+        """
+        INSERT INTO public.portfolio_cash (
+            portfolio_id, broker, currency, cash_balance,
+            cash_balance_base, updated_at
+        )
+        VALUES ($1, 'IBKR', $2, $3, $3, now())
+        ON CONFLICT (portfolio_id, broker, currency)
+        DO UPDATE SET
+            cash_balance = EXCLUDED.cash_balance,
+            cash_balance_base = EXCLUDED.cash_balance_base,
+            updated_at = now()
+        """,
+        portfolio_id,
+        currency,
+        cash,
+    )
+
+    # Replace IBKR positions with the latest snapshot.
+    await conn.execute(
+        """
+        DELETE FROM public.positions
+        WHERE portfolio_id = $1
+        AND broker = 'IBKR'
+        """,
+        portfolio_id,
+    )
+
+    positions_seen = 0
+    positions_inserted = 0
+    total_position_value_base = 0
+    total_open_pnl_base = 0
+
+    for elem in root.iter():
+        if elem.tag.lower().endswith("openposition"):
+            data = elem.attrib
+            positions_seen += 1
+
+            symbol = data.get("symbol") or data.get("description") or "UNKNOWN"
+            asset_class = detect_ibkr_asset_class(data.get("assetCategory"))
+            position = parse_decimal(data.get("position"), 0)
+            avg_cost = parse_decimal(data.get("costBasisPrice") or data.get("openPrice"), 0)
+            position_currency = data.get("currency") or currency
+            mark_price = parse_decimal(data.get("markPrice"), 0)
+
+            fx_rate_to_base = parse_decimal(data.get("fxRateToBase"), 1)
+            position_value_native = parse_decimal(data.get("positionValue"), 0)
+            position_value_base = position_value_native * fx_rate_to_base
+
+            open_pnl_native = parse_decimal(data.get("fifoPnlUnrealized"), 0)
+            open_pnl_base = open_pnl_native * fx_rate_to_base
+
+            total_position_value_base += position_value_base
+            total_open_pnl_base += open_pnl_base
+
+            await conn.execute(
+                """
+                INSERT INTO public.positions (
+                    portfolio_id, broker, symbol, asset_class,
+                    quantity, avg_cost, currency, market_price,
+                    market_value_native, market_value_base,
+                    open_pnl_native, open_pnl_base, updated_at
+                )
+                VALUES (
+                    $1, 'IBKR', $2, $3,
+                    $4, $5, $6, $7,
+                    $8, $9,
+                    $10, $11, now()
+                )
+                ON CONFLICT (portfolio_id, broker, symbol)
+                DO UPDATE SET
+                    asset_class = EXCLUDED.asset_class,
+                    quantity = EXCLUDED.quantity,
+                    avg_cost = EXCLUDED.avg_cost,
+                    currency = EXCLUDED.currency,
+                    market_price = EXCLUDED.market_price,
+                    market_value_native = EXCLUDED.market_value_native,
+                    market_value_base = EXCLUDED.market_value_base,
+                    open_pnl_native = EXCLUDED.open_pnl_native,
+                    open_pnl_base = EXCLUDED.open_pnl_base,
+                    updated_at = now()
+                """,
+                portfolio_id,
+                symbol,
+                asset_class,
+                position,
+                avg_cost,
+                position_currency,
+                mark_price,
+                position_value_native,
+                position_value_base,
+                open_pnl_native,
+                open_pnl_base,
+            )
+
+            positions_inserted += 1
+
+    return {
+        "portfolio": portfolio_name,
+        "snapshot_imported": True,
+        "snapshot_date": snapshot_date.isoformat(),
+        "currency": currency,
+        "nav": nav,
+        "cash": cash,
+        "market_value": market_value,
+        "open_pnl": open_pnl,
+        "positions_seen": positions_seen,
+        "positions_inserted": positions_inserted,
+        "total_position_value_base": total_position_value_base,
+        "total_open_pnl_base": total_open_pnl_base,
+    }
+
     # -------------------------------------------------
     # CASE 2: CSV Flex Report / Activity Statement fallback
     # -------------------------------------------------
@@ -770,6 +958,8 @@ async def run_ibkr_sync_job():
 
             xml_text = await fetch_ibkr_flex_report(query_id)
             result = await upsert_ibkr_trades(conn, portfolio_name, xml_text)
+            snapshot_result = await upsert_ibkr_snapshot_and_positions(conn, portfolio_name, xml_text)
+            result["snapshot"] = snapshot_result
 
             await finish_import_job(
                 conn,
