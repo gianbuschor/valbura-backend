@@ -793,6 +793,7 @@ async def upsert_bitget_rows(conn, portfolio_name: str, rows: list, product_type
 
     rows_seen = 0
     rows_inserted = 0
+    rows_updated = 0
 
     for row in rows:
         rows_seen += 1
@@ -818,6 +819,16 @@ async def upsert_bitget_rows(conn, portfolio_name: str, rows: list, product_type
         except Exception:
             trade_time = datetime.now(timezone.utc)
 
+        existing_trade = await conn.fetchrow(
+            """
+            SELECT id
+            FROM public.trades
+            WHERE broker = 'Bitget'
+            AND external_trade_id = $1
+            """,
+            trade_id,
+        )
+        
         result = await conn.execute(
             """
             INSERT INTO public.trades (
@@ -859,7 +870,9 @@ async def upsert_bitget_rows(conn, portfolio_name: str, rows: list, product_type
             json.dumps(row),
         )
 
-        if result == "INSERT 0 1":
+        if existing_trade:
+            rows_updated += 1
+        else:
             rows_inserted += 1
 
     return {
@@ -867,6 +880,7 @@ async def upsert_bitget_rows(conn, portfolio_name: str, rows: list, product_type
         "product_type": product_type,
         "rows_seen": rows_seen,
         "rows_inserted": rows_inserted,
+        "rows_updated": rows_updated,
     }
 
 
@@ -882,6 +896,7 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
     try:
         total_seen = 0
         total_inserted = 0
+        total_updated = 0
         results = []
 
         product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
@@ -897,6 +912,7 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
 
             portfolio_seen = 0
             portfolio_inserted = 0
+            portfolio_updated = 0
 
             for product_type in product_types:
                 data = await bitget_get(
@@ -917,6 +933,7 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
 
                 portfolio_seen += result["rows_seen"]
                 portfolio_inserted += result["rows_inserted"]
+                portfolio_updated += result["rows_updated"]
                 results.append(result)
 
             await finish_import_job(
@@ -925,11 +942,13 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 "success",
                 rows_seen=portfolio_seen,
                 rows_inserted=portfolio_inserted,
+                rows_updated=portfolio_updated,
                 metadata={"results": results},
             )
 
             total_seen += portfolio_seen
             total_inserted += portfolio_inserted
+            total_updated += portfolio_updated
 
         return JSONResponse(
             content={
@@ -937,8 +956,9 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 "broker": "Bitget",
                 "rows_seen": total_seen,
                 "rows_inserted": total_inserted,
+                "rows_updated": total_updated,
                 "results": results,
-            }
+             }
         )
 
     except Exception as e:
