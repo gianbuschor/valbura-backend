@@ -974,6 +974,7 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
 
         rows_seen = 0
         rows_inserted = 0
+        rows_updated = 0
 
         for deal in payload:
             rows_seen += 1
@@ -1000,6 +1001,16 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
             except Exception:
                 trade_time = datetime.now(timezone.utc)
 
+            existing_trade = await conn.fetchrow(
+                """
+                SELECT id
+                FROM public.trades
+                WHERE broker = 'MT5'
+                AND external_trade_id = $1
+                """,
+                external_id,
+            )
+            
             result = await conn.execute(
                 """
                 INSERT INTO public.trades (
@@ -1036,7 +1047,9 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
                 json.dumps(deal),
             )
 
-            if result == "INSERT 0 1":
+            if existing_trade:
+                rows_updated += 1
+            else:
                 rows_inserted += 1
 
             if profit != 0:
@@ -1072,6 +1085,7 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
             "success",
             rows_seen=rows_seen,
             rows_inserted=rows_inserted,
+            rows_updated=rows_updated,
         )
 
         return JSONResponse(
@@ -1080,6 +1094,7 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
                 "broker": "MT5",
                 "rows_seen": rows_seen,
                 "rows_inserted": rows_inserted,
+                "rows_updated": rows_updated,
             }
         )
 
