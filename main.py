@@ -440,6 +440,7 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
 
     rows_seen = 0
     rows_inserted = 0
+    rows_updated = 0
 
     report_text_stripped = report_text.strip()
 
@@ -480,6 +481,16 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
                     commission = parse_decimal(data.get("ibCommission"), 0)
                     trade_time = parse_dt(data.get("dateTime") or data.get("tradeDate"))
 
+                    existing_trade = await conn.fetchrow(
+                        """
+                        SELECT id
+                        FROM public.trades
+                        WHERE broker = 'IBKR'
+                        AND external_trade_id = $1
+                        """,
+                        trade_id,
+                    )
+                    
                     result = await conn.execute(
                         """
                         INSERT INTO public.trades (
@@ -522,12 +533,15 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
                         json.dumps(data),
                     )
 
-                    if result == "INSERT 0 1":
+                    if existing_trade:
+                        rows_updated += 1
+                    else:
                         rows_inserted += 1
 
             return {
                 "rows_seen": rows_seen,
                 "rows_inserted": rows_inserted,
+                "rows_updated": rows_updated,
                 "portfolio": portfolio_name,
                 "format": "xml",
             }
@@ -579,6 +593,16 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
                 "row": row,
             }
 
+            existing_trade = await conn.fetchrow(
+                """
+                SELECT id
+                FROM public.trades
+                WHERE broker = 'IBKR'
+                AND external_trade_id = $1
+                """,
+                trade_id,
+            )
+            
             result = await conn.execute(
                 """
                 INSERT INTO public.trades (
@@ -621,12 +645,15 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
                 json.dumps(data),
             )
 
-            if result == "INSERT 0 1":
+            if existing_trade:
+                rows_updated += 1
+            else:
                 rows_inserted += 1
 
     return {
         "rows_seen": rows_seen,
         "rows_inserted": rows_inserted,
+        "rows_updated": rows_updated,
         "portfolio": portfolio_name,
         "format": "csv",
     }
@@ -637,6 +664,7 @@ async def run_ibkr_sync_job():
     job_id = None
     total_seen = 0
     total_inserted = 0
+    total_updated = 0
     results = []
 
     try:
@@ -666,11 +694,13 @@ async def run_ibkr_sync_job():
                 "success",
                 rows_seen=result["rows_seen"],
                 rows_inserted=result["rows_inserted"],
+                rows_updated=result["rows_updated"],
                 metadata=result,
             )
-
+            
             total_seen += result["rows_seen"]
             total_inserted += result["rows_inserted"]
+            total_updated += result["rows_updated"]
             results.append(result)
 
         return {
@@ -678,6 +708,7 @@ async def run_ibkr_sync_job():
             "broker": "IBKR",
             "rows_seen": total_seen,
             "rows_inserted": total_inserted,
+            "rows_updated": total_updated,
             "results": results,
         }
 
