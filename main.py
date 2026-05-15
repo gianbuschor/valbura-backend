@@ -1172,3 +1172,199 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
 
     finally:
         await conn.close()
+
+@app.post("/sync/mt5/snapshot")
+async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = Header(None)):
+    expected_token = os.getenv("MT5_INGEST_TOKEN")
+    if expected_token and x_valbura_token != expected_token:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    payload = await request.json()
+
+    if not isinstance(payload, dict):
+        return JSONResponse(content={"error": "Payload must be an object"}, status_code=400)
+
+    account = payload.get("account") or {}
+    positions = payload.get("positions") or []
+    synced_at = payload.get("synced_at")
+
+    account_login = str(account.get("login") or "")
+    currency = account.get("currency") or "USD"
+
+    conn = await get_conn()
+    job_id = None
+
+    try:
+        job_id = await start_import_job(
+            conn,
+            "MT5",
+            "Day Trading",
+            {
+                "type": "snapshot",
+                "account_login": account_login,
+                "positions": len(positions),
+            },
+        )
+
+        portfolio_id = await get_portfolio_id(conn, "Day Trading")
+
+        snapshot_time = parse_dt(synced_at)
+        snapshot_date = snapshot_time.date()
+
+        balance = parse_decimal(account.get("balance"), 0)
+        equity = parse_decimal(account.get("equity"), 0)
+        margin = parse_decimal(account.get("margin"), 0)
+        profit = parse_decimal(account.get("profit"), 0)
+
+        # NAV snapshot
+        await conn.execute(
+            """
+            INSERT INTO public.portfolio_nav_snapshots (
+                portfolio_id, broker, snapshot_date, currency,
+                nav, cash, market_value, open_pnl, closed_pnl,
+                deposits_withdrawals, source
+            )
+            VALUES (
+                $1, 'MT5', $2, $3,
+                $4, $5, NULL, $6, NULL,
+                NULL, 'mt5_snapshot'
+            )
+            ON CONFLICT (portfolio_id, broker, snapshot_date, currency)
+            DO UPDATE SET
+                nav = EXCLUDED.nav,
+                cash = EXCLUDED.cash,
+                open_pnl = EXCLUDED.open_pnl,
+                source = EXCLUDED.source,
+                created_at = now()
+            """,
+            portfolio_id,
+            snapshot_date,
+            currency,
+            equity,
+            balance,
+            profit,
+        )
+
+        # Cash snapshot
+        await conn.execute(
+            """
+            INSERT INTO public.portfolio_cash (
+                portfolio_id, broker, currency, cash_balance,
+                cash_balance_base, updated_at
+            )
+            VALUES ($1, 'MT5', $2, $3, $3, now())
+            ON CONFLICT (portfolio_id, broker, currency)
+            DO UPDATE SET
+                cash_balance = EXCLUDED.cash_balance,
+                cash_balance_base = EXCLUDED.cash_balance_base,
+                updated_at = now()
+            """,
+            portfolio_id,
+            currency,
+            balance,
+        )
+
+        # Clear old MT5 positions for this portfolio before inserting fresh snapshot
+        await conn.execute(
+            """
+            DELETE FROM public.positions
+            WHERE portfolio_id = $1
+            AND broker = 'MT5'
+            """,
+            portfolio_id,
+        )
+
+        rows_seen = 0
+        rows_inserted = 0
+
+        for pos in positions:
+            rows_seen += 1
+
+            symbol = pos.get("symbol") or "UNKNOWN"
+            volume = parse_decimal(pos.get("volume"), 0)
+            price_open = parse_decimal(pos.get("price_open"), 0)
+            price_current = parse_decimal(pos.get("price_current"), 0)
+            position_profit = parse_decimal(pos.get("profit"), 0)
+
+            market_value_native = abs(volume * price_current)
+            open_pnl_native = position_profit
+
+            await conn.execute(
+                """
+                INSERT INTO public.positions (
+                    portfolio_id, broker, symbol, asset_class,
+                    quantity, avg_cost, currency, market_price,
+                    market_value_native, market_value_base,
+                    open_pnl_native, open_pnl_base, updated_at
+                )
+                VALUES (
+                    $1, 'MT5', $2, 'Index',
+                    $3, $4, $5, $6,
+                    $7, $7,
+                    $8, $8, now()
+                )
+                ON CONFLICT (portfolio_id, broker, symbol)
+                DO UPDATE SET
+                    quantity = EXCLUDED.quantity,
+                    avg_cost = EXCLUDED.avg_cost,
+                    currency = EXCLUDED.currency,
+                    market_price = EXCLUDED.market_price,
+                    market_value_native = EXCLUDED.market_value_native,
+                    market_value_base = EXCLUDED.market_value_base,
+                    open_pnl_native = EXCLUDED.open_pnl_native,
+                    open_pnl_base = EXCLUDED.open_pnl_base,
+                    updated_at = now()
+                """,
+                portfolio_id,
+                symbol,
+                volume,
+                price_open,
+                currency,
+                price_current,
+                market_value_native,
+                open_pnl_native,
+            )
+
+            rows_inserted += 1
+
+        await finish_import_job(
+            conn,
+            job_id,
+            "success",
+            rows_seen=rows_seen,
+            rows_inserted=rows_inserted,
+            rows_updated=0,
+            metadata={
+                "type": "snapshot",
+                "account_login": account_login,
+                "currency": currency,
+                "nav": equity,
+                "cash": balance,
+                "open_pnl": profit,
+                "margin": margin,
+                "positions": rows_seen,
+            },
+        )
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "broker": "MT5",
+                "type": "snapshot",
+                "account_login": account_login,
+                "currency": currency,
+                "nav": equity,
+                "cash": balance,
+                "open_pnl": profit,
+                "positions": rows_seen,
+            }
+        )
+
+    except Exception as e:
+        if job_id:
+            await finish_import_job(conn, job_id, "failed", error_message=str(e))
+        await log_sync_error(conn, "MT5", "Day Trading", str(e), payload)
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+
+    finally:
+        await conn.close()
