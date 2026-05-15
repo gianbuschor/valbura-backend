@@ -1179,6 +1179,49 @@ async def bitget_get(path: str, params: dict):
             raise RuntimeError(f"Bitget API error: {data}")
         return data
 
+@app.post("/debug/bitget/account")
+async def debug_bitget_account(x_admin_token: Optional[str] = Header(None)):
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    results = {}
+
+    try:
+        for product_type in ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]:
+            try:
+                account_data = await bitget_get(
+                    "/api/v2/mix/account/accounts",
+                    {"productType": product_type}
+                )
+
+                positions_data = await bitget_get(
+                    "/api/v2/mix/position/all-position",
+                    {
+                        "productType": product_type,
+                        "marginCoin": "USDT" if product_type == "USDT-FUTURES" else None,
+                    }
+                )
+
+                results[product_type] = {
+                    "account_status": "success",
+                    "account_sample": account_data.get("data"),
+                    "positions_status": "success",
+                    "positions_sample": positions_data.get("data"),
+                }
+
+            except Exception as inner_e:
+                results[product_type] = {
+                    "status": "failed",
+                    "error": str(inner_e),
+                }
+
+        return JSONResponse(content={"status": "success", "results": results})
+
+    except Exception as e:
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+
 
 def bitget_side_to_side(row: dict):
     side = (
