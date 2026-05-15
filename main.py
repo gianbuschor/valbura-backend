@@ -629,7 +629,7 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
                 "format": "xml",
             }
 
-  async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text: str):
+async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text: str):
     portfolio_id = await get_portfolio_id(conn, portfolio_name)
 
     report_text_stripped = xml_text.strip()
