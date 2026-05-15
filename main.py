@@ -817,6 +817,105 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
         "total_open_pnl_base": total_open_pnl_base,
     }
 
+async def upsert_ibkr_realized_pnl(conn, portfolio_name: str, xml_text: str):
+    portfolio_id = await get_portfolio_id(conn, portfolio_name)
+
+    report_text_stripped = xml_text.strip()
+    if not report_text_stripped.startswith("<"):
+        return {
+            "portfolio": portfolio_name,
+            "realized_imported": False,
+            "reason": "IBKR report is not XML",
+        }
+
+    root = ET.fromstring(xml_text)
+
+    rows_seen = 0
+    rows_inserted = 0
+    rows_updated = 0
+    total_realized_pnl = 0
+
+    for elem in root.iter():
+        if elem.tag.lower().endswith("fifoperformancesummaryunderlying"):
+            data = elem.attrib
+            rows_seen += 1
+
+            symbol = data.get("underlyingSymbol") or data.get("symbol") or "UNKNOWN"
+            asset_class = detect_ibkr_asset_class(data.get("assetCategory"))
+            currency = "CHF"
+
+            realized_pnl = parse_decimal(data.get("totalRealizedPnl"), 0)
+            unrealized_pnl = parse_decimal(data.get("totalUnrealizedPnl"), 0)
+            total_fifo_pnl = parse_decimal(data.get("totalFifoPnl"), 0)
+
+            # Skip pure zero rows to avoid noisy events
+            if realized_pnl == 0 and unrealized_pnl == 0 and total_fifo_pnl == 0:
+                continue
+
+            event_date_raw = data.get("reportDate") or ""
+            event_time = parse_dt(event_date_raw) if event_date_raw else datetime.now(timezone.utc)
+
+            external_id = f"{portfolio_name}:ibkr-fifo-{symbol}-{event_date_raw or 'latest'}"
+
+            existing_event = await conn.fetchrow(
+                """
+                SELECT id
+                FROM public.realized_pnl_events
+                WHERE broker = 'IBKR'
+                AND external_id = $1
+                """,
+                external_id,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO public.realized_pnl_events (
+                    portfolio_id, broker, symbol, asset_class,
+                    realized_pnl, currency, realized_pnl_base,
+                    event_time, external_id, raw_payload
+                )
+                VALUES (
+                    $1, 'IBKR', $2, $3,
+                    $4, $5, $4,
+                    $6, $7, $8::jsonb
+                )
+                ON CONFLICT (broker, external_id)
+                DO UPDATE SET
+                    portfolio_id = EXCLUDED.portfolio_id,
+                    symbol = EXCLUDED.symbol,
+                    asset_class = EXCLUDED.asset_class,
+                    realized_pnl = EXCLUDED.realized_pnl,
+                    currency = EXCLUDED.currency,
+                    realized_pnl_base = EXCLUDED.realized_pnl_base,
+                    event_time = EXCLUDED.event_time,
+                    raw_payload = EXCLUDED.raw_payload
+                """,
+                portfolio_id,
+                symbol,
+                asset_class,
+                realized_pnl,
+                currency,
+                event_time,
+                external_id,
+                json.dumps(data),
+            )
+
+            if existing_event:
+                rows_updated += 1
+            else:
+                rows_inserted += 1
+
+            total_realized_pnl += realized_pnl
+
+    return {
+        "portfolio": portfolio_name,
+        "realized_imported": True,
+        "rows_seen": rows_seen,
+        "rows_inserted": rows_inserted,
+        "rows_updated": rows_updated,
+        "total_realized_pnl": total_realized_pnl,
+    }
+    
     # -------------------------------------------------
     # CASE 2: CSV Flex Report / Activity Statement fallback
     # -------------------------------------------------
@@ -959,7 +1058,10 @@ async def run_ibkr_sync_job():
             xml_text = await fetch_ibkr_flex_report(query_id)
             result = await upsert_ibkr_trades(conn, portfolio_name, xml_text)
             snapshot_result = await upsert_ibkr_snapshot_and_positions(conn, portfolio_name, xml_text)
+            realized_result = await upsert_ibkr_realized_pnl(conn, portfolio_name, xml_text)
+            
             result["snapshot"] = snapshot_result
+            result["realized_pnl"] = realized_result
 
             await finish_import_job(
                 conn,
