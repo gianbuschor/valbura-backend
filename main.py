@@ -1332,6 +1332,191 @@ async def upsert_bitget_rows(conn, portfolio_name: str, rows: list, product_type
         "rows_updated": rows_updated,
     }
 
+async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
+    portfolio_id = await get_portfolio_id(conn, portfolio_name)
+
+    product_type = "USDT-FUTURES"
+    margin_coin = "USDT"
+
+    account_data = await bitget_get(
+        "/api/v2/mix/account/accounts",
+        {"productType": product_type},
+    )
+
+    positions_data = await bitget_get(
+        "/api/v2/mix/position/all-position",
+        {
+            "productType": product_type,
+            "marginCoin": margin_coin,
+        },
+    )
+
+    accounts = account_data.get("data") or []
+    if isinstance(accounts, dict):
+        accounts = [accounts]
+
+    account = None
+    for item in accounts:
+        if item.get("marginCoin") == margin_coin:
+            account = item
+            break
+
+    if account is None and accounts:
+        account = accounts[0]
+
+    if account is None:
+        return {
+            "portfolio": portfolio_name,
+            "snapshot_imported": False,
+            "reason": "No Bitget account data found",
+        }
+
+    now_dt = datetime.now(timezone.utc)
+    snapshot_date = now_dt.date()
+
+    nav = parse_decimal(account.get("accountEquity") or account.get("usdtEquity"), 0)
+    cash = parse_decimal(account.get("available"), 0)
+    open_pnl = parse_decimal(account.get("unrealizedPL"), 0)
+    market_value = nav - cash
+
+    await conn.execute(
+        """
+        INSERT INTO public.portfolio_nav_snapshots (
+            portfolio_id, broker, snapshot_date, currency,
+            nav, cash, market_value, open_pnl, closed_pnl,
+            deposits_withdrawals, source
+        )
+        VALUES (
+            $1, 'Bitget', $2, 'USDT',
+            $3, $4, $5, $6, NULL,
+            NULL, 'bitget_account_snapshot'
+        )
+        ON CONFLICT (portfolio_id, broker, snapshot_date, currency)
+        DO UPDATE SET
+            nav = EXCLUDED.nav,
+            cash = EXCLUDED.cash,
+            market_value = EXCLUDED.market_value,
+            open_pnl = EXCLUDED.open_pnl,
+            source = EXCLUDED.source,
+            created_at = now()
+        """,
+        portfolio_id,
+        snapshot_date,
+        nav,
+        cash,
+        market_value,
+        open_pnl,
+    )
+
+    await conn.execute(
+        """
+        INSERT INTO public.portfolio_cash (
+            portfolio_id, broker, currency, cash_balance,
+            cash_balance_base, updated_at
+        )
+        VALUES ($1, 'Bitget', 'USDT', $2, $2, now())
+        ON CONFLICT (portfolio_id, broker, currency)
+        DO UPDATE SET
+            cash_balance = EXCLUDED.cash_balance,
+            cash_balance_base = EXCLUDED.cash_balance_base,
+            updated_at = now()
+        """,
+        portfolio_id,
+        cash,
+    )
+
+    await conn.execute(
+        """
+        DELETE FROM public.positions
+        WHERE portfolio_id = $1
+        AND broker = 'Bitget'
+        """,
+        portfolio_id,
+    )
+
+    positions = positions_data.get("data") or []
+    if isinstance(positions, dict):
+        positions = [positions]
+
+    positions_seen = 0
+    positions_inserted = 0
+
+    for pos in positions:
+        symbol = pos.get("symbol") or "UNKNOWN"
+        total = parse_decimal(pos.get("total"), 0)
+
+        # Skip empty/closed positions
+        if total == 0:
+            continue
+
+        positions_seen += 1
+
+        hold_side = (pos.get("holdSide") or "").lower()
+        quantity = total
+        if hold_side == "short":
+            quantity = -abs(quantity)
+
+        avg_cost = parse_decimal(pos.get("openPriceAvg"), 0)
+        mark_price = parse_decimal(pos.get("markPrice"), 0)
+        open_pnl_native = parse_decimal(pos.get("unrealizedPL"), 0)
+
+        # For USDT futures, approximate position notional as quantity * mark price.
+        market_value_native = abs(quantity * mark_price)
+        market_value_base = market_value_native
+        open_pnl_base = open_pnl_native
+
+        await conn.execute(
+            """
+            INSERT INTO public.positions (
+                portfolio_id, broker, symbol, asset_class,
+                quantity, avg_cost, currency, market_price,
+                market_value_native, market_value_base,
+                open_pnl_native, open_pnl_base, updated_at
+            )
+            VALUES (
+                $1, 'Bitget', $2, 'Crypto Futures',
+                $3, $4, 'USDT', $5,
+                $6, $7,
+                $8, $9, now()
+            )
+            ON CONFLICT (portfolio_id, broker, symbol)
+            DO UPDATE SET
+                asset_class = EXCLUDED.asset_class,
+                quantity = EXCLUDED.quantity,
+                avg_cost = EXCLUDED.avg_cost,
+                currency = EXCLUDED.currency,
+                market_price = EXCLUDED.market_price,
+                market_value_native = EXCLUDED.market_value_native,
+                market_value_base = EXCLUDED.market_value_base,
+                open_pnl_native = EXCLUDED.open_pnl_native,
+                open_pnl_base = EXCLUDED.open_pnl_base,
+                updated_at = now()
+            """,
+            portfolio_id,
+            symbol,
+            quantity,
+            avg_cost,
+            mark_price,
+            market_value_native,
+            market_value_base,
+            open_pnl_native,
+            open_pnl_base,
+        )
+
+        positions_inserted += 1
+
+    return {
+        "portfolio": portfolio_name,
+        "snapshot_imported": True,
+        "currency": "USDT",
+        "nav": nav,
+        "cash": cash,
+        "market_value": market_value,
+        "open_pnl": open_pnl,
+        "positions_seen": positions_seen,
+        "positions_inserted": positions_inserted,
+    }
+
 
 @app.post("/sync/bitget")
 async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
@@ -1385,6 +1570,8 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 portfolio_updated += result["rows_updated"]
                 results.append(result)
 
+            snapshot_result = await upsert_bitget_snapshot_and_positions(conn, portfolio_name)
+
             await finish_import_job(
                 conn,
                 job_id,
@@ -1392,7 +1579,10 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 rows_seen=portfolio_seen,
                 rows_inserted=portfolio_inserted,
                 rows_updated=portfolio_updated,
-                metadata={"results": results},
+                metadata={
+                    "results": results,
+                    "snapshot": snapshot_result,
+                },
             )
 
             total_seen += portfolio_seen
