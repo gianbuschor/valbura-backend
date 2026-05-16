@@ -410,6 +410,112 @@ async def get_position_allocation(portfolio: str, group_by: str = "asset_class")
     finally:
         await conn.close()
 
+@app.get("/public/dashboard")
+async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
+    conn = await get_conn()
+    try:
+        summary_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_public_portfolio_summary
+            WHERE portfolio_name = $1
+            """,
+            portfolio,
+        )
+
+        nav_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_portfolio_nav_snapshots_base
+            WHERE portfolio_name = $1
+            ORDER BY broker, snapshot_date DESC, created_at DESC
+            """,
+            portfolio,
+        )
+
+        allocation_asset_class_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_position_allocation_asset_class
+            WHERE portfolio_name = $1
+            ORDER BY allocation_percent DESC
+            """,
+            portfolio,
+        )
+
+        allocation_broker_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_position_allocation_broker
+            WHERE portfolio_name = $1
+            ORDER BY allocation_percent DESC
+            """,
+            portfolio,
+        )
+
+        allocation_symbol_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_position_allocation_symbol
+            WHERE portfolio_name = $1
+            ORDER BY allocation_percent DESC
+            """,
+            portfolio,
+        )
+
+        position_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_positions_public
+            WHERE portfolio_name = $1
+            ORDER BY ABS(market_value_base) DESC NULLS LAST
+            """,
+            portfolio,
+        )
+
+        trade_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_recent_trades_base
+            WHERE portfolio_name = $1
+            ORDER BY trade_timestamp DESC
+            LIMIT $2
+            """,
+            portfolio,
+            trade_limit,
+        )
+
+        sync_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_sync_status
+            WHERE portfolio_name = $1
+            ORDER BY started_at DESC
+            """,
+            portfolio,
+        )
+
+        return JSONResponse(
+            content=json_safe(
+                {
+                    "portfolio": portfolio,
+                    "summary": dict(summary_rows[0]) if summary_rows else None,
+                    "nav_by_broker": [dict(row) for row in nav_rows],
+                    "allocation": {
+                        "asset_class": [dict(row) for row in allocation_asset_class_rows],
+                        "broker": [dict(row) for row in allocation_broker_rows],
+                        "symbol": [dict(row) for row in allocation_symbol_rows],
+                    },
+                    "positions": [dict(row) for row in position_rows],
+                    "recent_trades": [dict(row) for row in trade_rows],
+                    "sync_status": [dict(row) for row in sync_rows],
+                }
+            )
+        )
+
+    finally:
+        await conn.close()
+
 
 # -------------------------
 # IBKR Flex importer
