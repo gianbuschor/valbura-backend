@@ -485,7 +485,7 @@ async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
             trade_limit,
         )
 
-                sync_rows = await conn.fetch(
+        sync_rows = await conn.fetch(
             """
             SELECT DISTINCT ON (broker) *
             FROM public.v_sync_status
@@ -528,7 +528,6 @@ async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
 
     finally:
         await conn.close()
-
 
 # -------------------------
 # IBKR Flex importer
