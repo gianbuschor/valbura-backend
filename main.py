@@ -425,7 +425,7 @@ async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
 
         nav_rows = await conn.fetch(
             """
-            SELECT *
+            SELECT DISTINCT ON (broker) *
             FROM public.v_portfolio_nav_snapshots_base
             WHERE portfolio_name = $1
             ORDER BY broker, snapshot_date DESC, created_at DESC
