@@ -485,12 +485,24 @@ async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
             trade_limit,
         )
 
-        sync_rows = await conn.fetch(
+                sync_rows = await conn.fetch(
             """
-            SELECT *
+            SELECT DISTINCT ON (broker) *
             FROM public.v_sync_status
             WHERE portfolio_name = $1
-            ORDER BY started_at DESC
+            AND status = 'success'
+            ORDER BY broker, finished_at DESC NULLS LAST, started_at DESC
+            """,
+            portfolio,
+        )
+
+        sync_error_rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (broker) *
+            FROM public.v_sync_status
+            WHERE portfolio_name = $1
+            AND status = 'failed'
+            ORDER BY broker, finished_at DESC NULLS LAST, started_at DESC
             """,
             portfolio,
         )
@@ -509,6 +521,7 @@ async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
                     "positions": [dict(row) for row in position_rows],
                     "recent_trades": [dict(row) for row in trade_rows],
                     "sync_status": [dict(row) for row in sync_rows],
+                    "sync_errors": [dict(row) for row in sync_error_rows],
                 }
             )
         )
