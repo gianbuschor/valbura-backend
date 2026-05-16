@@ -1609,6 +1609,89 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
     finally:
         await conn.close()
 
+@app.post("/sync/fx")
+async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    conn = await get_conn()
+
+    try:
+        today = datetime.now(timezone.utc).date()
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get("https://open.er-api.com/v6/latest/USD")
+            data = response.json()
+
+        if data.get("result") != "success":
+            raise RuntimeError(f"FX API error: {data}")
+
+        rates = data.get("rates") or {}
+
+        usd_chf = parse_decimal(rates.get("CHF"), None)
+        usd_eur = parse_decimal(rates.get("EUR"), None)
+        usd_gbp = parse_decimal(rates.get("GBP"), None)
+
+        if not usd_chf:
+            raise RuntimeError("USDCHF rate missing from FX API")
+
+        rows = [
+            ("USD", "CHF", usd_chf, "open_er_api"),
+            ("USDT", "CHF", usd_chf, "open_er_api_usdt_as_usd"),
+            ("USD", "USD", 1, "system"),
+            ("USDT", "USDT", 1, "system"),
+            ("CHF", "CHF", 1, "system"),
+        ]
+
+        if usd_eur:
+            rows.append(("USD", "EUR", usd_eur, "open_er_api"))
+            rows.append(("USDT", "EUR", usd_eur, "open_er_api_usdt_as_usd"))
+            rows.append(("EUR", "EUR", 1, "system"))
+
+        if usd_gbp:
+            rows.append(("USD", "GBP", usd_gbp, "open_er_api"))
+            rows.append(("USDT", "GBP", usd_gbp, "open_er_api_usdt_as_usd"))
+            rows.append(("GBP", "GBP", 1, "system"))
+
+        for from_currency, to_currency, rate, source in rows:
+            await conn.execute(
+                """
+                INSERT INTO public.fx_rates (
+                    rate_date, from_currency, to_currency, rate, source
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (rate_date, from_currency, to_currency)
+                DO UPDATE SET
+                    rate = EXCLUDED.rate,
+                    source = EXCLUDED.source,
+                    created_at = now()
+                """,
+                today,
+                from_currency,
+                to_currency,
+                rate,
+                source,
+            )
+
+        return JSONResponse(
+            content={
+                "status": "success",
+                "date": today.isoformat(),
+                "usd_chf": usd_chf,
+                "usd_eur": usd_eur,
+                "usd_gbp": usd_gbp,
+                "rows_upserted": len(rows),
+            }
+        )
+
+    except Exception as e:
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+
+    finally:
+        await conn.close()
+
 
 # -------------------------
 # MT5 ingest endpoint
