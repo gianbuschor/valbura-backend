@@ -382,6 +382,34 @@ async def get_portfolio_summary(portfolio: Optional[str] = None):
 async def health():
     return {"status": "ok"}
 
+@app.get("/public/position-allocation")
+async def get_position_allocation(portfolio: str, group_by: str = "asset_class"):
+    view_map = {
+        "asset_class": "v_position_allocation_asset_class",
+        "broker": "v_position_allocation_broker",
+        "currency": "v_position_allocation_currency",
+        "symbol": "v_position_allocation_symbol",
+    }
+
+    view = view_map.get(group_by.lower())
+    if not view:
+        return JSONResponse(content={"error": "Invalid group_by"}, status_code=400)
+
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch(
+            f"""
+            SELECT *
+            FROM public.{view}
+            WHERE portfolio_name = $1
+            ORDER BY allocation_percent DESC
+            """,
+            portfolio,
+        )
+        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+    finally:
+        await conn.close()
+
 
 # -------------------------
 # IBKR Flex importer
