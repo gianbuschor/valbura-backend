@@ -306,7 +306,7 @@ async def get_positions(portfolio: Optional[str] = None):
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_positions_public
+                FROM public.v_positions_public_base
                 WHERE portfolio_name = $1
                 ORDER BY market_value_base DESC NULLS LAST
                 """,
@@ -316,7 +316,7 @@ async def get_positions(portfolio: Optional[str] = None):
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_positions_public
+                FROM public.v_positions_public_base
                 ORDER BY portfolio_name, market_value_base DESC NULLS LAST
                 """
             )
@@ -466,7 +466,7 @@ async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
         position_rows = await conn.fetch(
             """
             SELECT *
-            FROM public.v_positions_public
+            FROM public.v_positions_public_base
             WHERE portfolio_name = $1
             ORDER BY ABS(market_value_base) DESC NULLS LAST
             """,
