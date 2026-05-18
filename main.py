@@ -1636,9 +1636,27 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
         if hold_side == "short":
             quantity = -abs(quantity)
 
+        position_side = "SHORT" if hold_side == "short" else "LONG" if hold_side == "long" else None
+
         avg_cost = parse_decimal(pos.get("openPriceAvg"), 0)
         mark_price = parse_decimal(pos.get("markPrice"), 0)
         open_pnl_native = parse_decimal(pos.get("unrealizedPL"), 0)
+
+        take_profit = parse_decimal(pos.get("takeProfit"), None)
+        stop_loss = parse_decimal(pos.get("stopLoss"), None)
+        take_profit_order_id = pos.get("takeProfitId") or None
+        stop_loss_order_id = pos.get("stopLossId") or None
+        source_position_id = (
+            pos.get("posId")
+            or pos.get("positionId")
+            or f"{product_type}:{symbol}:{hold_side}"
+        )
+
+        entry_time_raw = pos.get("cTime") or pos.get("uTime")
+        try:
+            entry_date = datetime.fromtimestamp(int(entry_time_raw) / 1000, tz=timezone.utc)
+        except Exception:
+            entry_date = None
 
         # For USDT futures, approximate position notional as quantity * mark price.
         market_value_native = abs(quantity * mark_price)
@@ -1651,13 +1669,23 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
                 portfolio_id, broker, symbol, asset_class,
                 quantity, avg_cost, currency, market_price,
                 market_value_native, market_value_base,
-                open_pnl_native, open_pnl_base, updated_at
+                open_pnl_native, open_pnl_base,
+                entry_date, position_side,
+                take_profit, stop_loss,
+                take_profit_order_id, stop_loss_order_id,
+                source_position_id,
+                updated_at
             )
             VALUES (
                 $1, 'Bitget', $2, 'Crypto Futures',
                 $3, $4, 'USDT', $5,
                 $6, $7,
-                $8, $9, now()
+                $8, $9,
+                $10, $11,
+                $12, $13,
+                $14, $15,
+                $16,
+                now()
             )
             ON CONFLICT (portfolio_id, broker, symbol)
             DO UPDATE SET
@@ -1670,6 +1698,13 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
                 market_value_base = EXCLUDED.market_value_base,
                 open_pnl_native = EXCLUDED.open_pnl_native,
                 open_pnl_base = EXCLUDED.open_pnl_base,
+                entry_date = EXCLUDED.entry_date,
+                position_side = EXCLUDED.position_side,
+                take_profit = EXCLUDED.take_profit,
+                stop_loss = EXCLUDED.stop_loss,
+                take_profit_order_id = EXCLUDED.take_profit_order_id,
+                stop_loss_order_id = EXCLUDED.stop_loss_order_id,
+                source_position_id = EXCLUDED.source_position_id,
                 updated_at = now()
             """,
             portfolio_id,
@@ -1681,6 +1716,13 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
             market_value_base,
             open_pnl_native,
             open_pnl_base,
+            entry_date,
+            position_side,
+            take_profit,
+            stop_loss,
+            take_profit_order_id,
+            stop_loss_order_id,
+            source_position_id,
         )
 
         positions_inserted += 1
