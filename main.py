@@ -1131,7 +1131,7 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
 
             current_ytd = ibkr_cashflow["ytd_deposit_withdrawals"]
 
-                if previous_cashflow and previous_cashflow["raw_payload"]:
+            if previous_cashflow and previous_cashflow["raw_payload"]:
                 previous_raw_payload = previous_cashflow["raw_payload"]
 
                 if isinstance(previous_raw_payload, str):
