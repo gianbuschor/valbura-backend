@@ -903,7 +903,9 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
         cash,
     )
 
-    # Replace IBKR positions with the latest snapshot.
+    # Replace only this portfolio's IBKR positions with the latest snapshot.
+    # Important: do not delete all IBKR positions globally, otherwise Global and
+    # Alternatives overwrite each other.
     await conn.execute(
         """
         DELETE FROM public.positions
@@ -940,7 +942,7 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             total_position_value_base += position_value_base
             total_open_pnl_base += open_pnl_base
 
-            position_side = "SHORT" if quantity < 0 else "LONG" if quantity > 0 else None
+            position_side = "SHORT" if position < 0 else "LONG" if position > 0 else None
 
             entry_row = await conn.fetchrow(
                 """
@@ -955,7 +957,7 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             )
             entry_date = entry_row["entry_date"] if entry_row else None
             source_position_id = data.get("conid") or data.get("symbol") or symbol
-            
+
             await conn.execute(
                 """
                 INSERT INTO public.positions (
@@ -993,18 +995,22 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
                     open_pnl_base = EXCLUDED.open_pnl_base,
                     entry_date = EXCLUDED.entry_date,
                     position_side = EXCLUDED.position_side,
+                    take_profit = EXCLUDED.take_profit,
+                    stop_loss = EXCLUDED.stop_loss,
+                    take_profit_order_id = EXCLUDED.take_profit_order_id,
+                    stop_loss_order_id = EXCLUDED.stop_loss_order_id,
                     source_position_id = EXCLUDED.source_position_id,
                     updated_at = now()
                 """,
                 portfolio_id,
                 symbol,
                 asset_class,
-                quantity,
+                position,
                 avg_cost,
-                currency,
+                position_currency,
                 mark_price,
-                market_value_native,
-                market_value_base,
+                position_value_native,
+                position_value_base,
                 open_pnl_native,
                 open_pnl_base,
                 entry_date,
