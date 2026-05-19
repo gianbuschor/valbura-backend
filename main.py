@@ -855,68 +855,10 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
 
     market_value = nav - cash
 
-    await conn.execute(
-        """
-        INSERT INTO public.portfolio_nav_snapshots (
-            portfolio_id, broker, snapshot_date, currency,
-            nav, cash, market_value, open_pnl, closed_pnl,
-            deposits_withdrawals, source
-        )
-        VALUES (
-            $1, 'IBKR', $2, $3,
-            $4, $5, $6, $7, NULL,
-            NULL, 'ibkr_flex_equity_summary'
-        )
-        ON CONFLICT (portfolio_id, broker, snapshot_date, currency)
-        DO UPDATE SET
-            nav = EXCLUDED.nav,
-            cash = EXCLUDED.cash,
-            market_value = EXCLUDED.market_value,
-            open_pnl = EXCLUDED.open_pnl,
-            source = EXCLUDED.source,
-            created_at = now()
-        """,
-        portfolio_id,
-        snapshot_date,
-        currency,
-        nav,
-        cash,
-        market_value,
-        open_pnl,
-    )
-
-    await conn.execute(
-        """
-        INSERT INTO public.portfolio_cash (
-            portfolio_id, broker, currency, cash_balance,
-            cash_balance_base, updated_at
-        )
-        VALUES ($1, 'IBKR', $2, $3, $3, now())
-        ON CONFLICT (portfolio_id, broker, currency)
-        DO UPDATE SET
-            cash_balance = EXCLUDED.cash_balance,
-            cash_balance_base = EXCLUDED.cash_balance_base,
-            updated_at = now()
-        """,
-        portfolio_id,
-        currency,
-        cash,
-    )
-
-    # Replace only this portfolio's IBKR positions with the latest snapshot.
-    # Important: do not delete all IBKR positions globally, otherwise Global and
-    # Alternatives overwrite each other.
-    await conn.execute(
-        """
-        DELETE FROM public.positions
-        WHERE portfolio_id = $1
-        AND broker = 'IBKR'
-        """,
-        portfolio_id,
-    )
-
+    # Build all position rows first. This avoids deleting existing positions if
+    # parsing/insertion would fail halfway through.
+    position_rows = []
     positions_seen = 0
-    positions_inserted = 0
     total_position_value_base = 0
     total_open_pnl_base = 0
 
@@ -958,6 +900,84 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             entry_date = entry_row["entry_date"] if entry_row else None
             source_position_id = data.get("conid") or data.get("symbol") or symbol
 
+            position_rows.append({
+                "symbol": symbol,
+                "asset_class": asset_class,
+                "position": position,
+                "avg_cost": avg_cost,
+                "position_currency": position_currency,
+                "mark_price": mark_price,
+                "position_value_native": position_value_native,
+                "position_value_base": position_value_base,
+                "open_pnl_native": open_pnl_native,
+                "open_pnl_base": open_pnl_base,
+                "entry_date": entry_date,
+                "position_side": position_side,
+                "source_position_id": source_position_id,
+            })
+
+    positions_inserted = 0
+
+    async with conn.transaction():
+        await conn.execute(
+            """
+            INSERT INTO public.portfolio_nav_snapshots (
+                portfolio_id, broker, snapshot_date, currency,
+                nav, cash, market_value, open_pnl, closed_pnl,
+                deposits_withdrawals, source
+            )
+            VALUES (
+                $1, 'IBKR', $2, $3,
+                $4, $5, $6, $7, NULL,
+                NULL, 'ibkr_flex_equity_summary'
+            )
+            ON CONFLICT (portfolio_id, broker, snapshot_date, currency)
+            DO UPDATE SET
+                nav = EXCLUDED.nav,
+                cash = EXCLUDED.cash,
+                market_value = EXCLUDED.market_value,
+                open_pnl = EXCLUDED.open_pnl,
+                source = EXCLUDED.source,
+                created_at = now()
+            """,
+            portfolio_id,
+            snapshot_date,
+            currency,
+            nav,
+            cash,
+            market_value,
+            open_pnl,
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO public.portfolio_cash (
+                portfolio_id, broker, currency, cash_balance,
+                cash_balance_base, updated_at
+            )
+            VALUES ($1, 'IBKR', $2, $3, $3, now())
+            ON CONFLICT (portfolio_id, broker, currency)
+            DO UPDATE SET
+                cash_balance = EXCLUDED.cash_balance,
+                cash_balance_base = EXCLUDED.cash_balance_base,
+                updated_at = now()
+            """,
+            portfolio_id,
+            currency,
+            cash,
+        )
+
+        # Replace only this portfolio's IBKR positions after parsing succeeded.
+        await conn.execute(
+            """
+            DELETE FROM public.positions
+            WHERE portfolio_id = $1
+            AND broker = 'IBKR'
+            """,
+            portfolio_id,
+        )
+
+        for row in position_rows:
             await conn.execute(
                 """
                 INSERT INTO public.positions (
@@ -1003,21 +1023,20 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
                     updated_at = now()
                 """,
                 portfolio_id,
-                symbol,
-                asset_class,
-                position,
-                avg_cost,
-                position_currency,
-                mark_price,
-                position_value_native,
-                position_value_base,
-                open_pnl_native,
-                open_pnl_base,
-                entry_date,
-                position_side,
-                source_position_id,
+                row["symbol"],
+                row["asset_class"],
+                row["position"],
+                row["avg_cost"],
+                row["position_currency"],
+                row["mark_price"],
+                row["position_value_native"],
+                row["position_value_base"],
+                row["open_pnl_native"],
+                row["open_pnl_base"],
+                row["entry_date"],
+                row["position_side"],
+                row["source_position_id"],
             )
-
             positions_inserted += 1
 
     return {
