@@ -1855,10 +1855,8 @@ async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
     except PermissionError:
         return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
 
-    product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
+    product_types = ["USDT-FUTURES"]
 
-    # Wir testen mehrere mögliche Bitget-Endpunkte/Plan-Typen,
-    # weil TP/SL je nach Order-Art nicht direkt an der Position hängt.
     plan_types = [
         "normal_plan",
         "track_plan",
@@ -1874,10 +1872,8 @@ async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
     for product_type in product_types:
         product_result = {}
 
-        # 1) Aktive Pending Orders
         try:
-            product_result["orders_pending"] = await bitget_request(
-                "GET",
+            product_result["orders_pending"] = await bitget_get(
                 "/api/v2/mix/order/orders-pending",
                 {
                     "productType": product_type,
@@ -1886,13 +1882,11 @@ async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
         except Exception as e:
             product_result["orders_pending_error"] = str(e)
 
-        # 2) Pending Plan Orders mit verschiedenen planType-Werten
         product_result["plan_orders"] = {}
 
         for plan_type in plan_types:
             try:
-                product_result["plan_orders"][plan_type] = await bitget_request(
-                    "GET",
+                product_result["plan_orders"][plan_type] = await bitget_get(
                     "/api/v2/mix/order/orders-plan-pending",
                     {
                         "productType": product_type,
