@@ -359,6 +359,41 @@ async def get_public_closed_positions(
     finally:
         await conn.close()
 
+@app.get("/public/closed-position-details")
+async def get_public_closed_position_details(
+    portfolio: Optional[str] = None,
+    limit: int = 300,
+):
+    conn = await get_conn()
+    try:
+        if portfolio:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.v_closed_positions_detail_public
+                WHERE portfolio_name = $1
+                ORDER BY exit_date DESC NULLS LAST, closed_pnl_base DESC NULLS LAST
+                LIMIT $2
+                """,
+                portfolio,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.v_closed_positions_detail_public
+                ORDER BY portfolio_name, exit_date DESC NULLS LAST, closed_pnl_base DESC NULLS LAST
+                LIMIT $1
+                """,
+                limit,
+            )
+
+        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+
+    finally:
+        await conn.close()
+
 
 @app.get("/public/nav")
 async def get_nav(portfolio: Optional[str] = None):
@@ -450,6 +485,7 @@ async def get_public_dashboard(
     portfolio: str,
     trade_limit: int = 25,
     closed_limit: int = 100,
+    closed_detail_limit: int = 200,
 ):
     conn = await get_conn()
     try:
@@ -535,6 +571,18 @@ async def get_public_dashboard(
             portfolio,
             closed_limit,
         )
+
+        closed_position_detail_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_closed_positions_detail_public
+            WHERE portfolio_name = $1
+            ORDER BY exit_date DESC NULLS LAST, closed_pnl_base DESC NULLS LAST
+            LIMIT $2
+            """,
+            portfolio,
+            closed_detail_limit,
+        )
         
         sync_rows = await conn.fetch(
             """
@@ -606,6 +654,7 @@ async def get_public_dashboard(
                     "positions": [dict(row) for row in position_rows],
                     "recent_trades": [dict(row) for row in trade_rows],
                     "closed_positions": [dict(row) for row in closed_position_rows],
+                    "closed_position_details": [dict(row) for row in closed_position_detail_rows],
                     "sync_status": [dict(row) for row in sync_rows],
                     "sync_errors": [dict(row) for row in sync_error_rows],
                 }
