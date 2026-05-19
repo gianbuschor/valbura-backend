@@ -583,6 +583,15 @@ async def get_public_dashboard(
             portfolio,
             closed_detail_limit,
         )
+
+        performance_row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM public.v_portfolio_performance_public
+            WHERE portfolio_name = $1
+            """,
+            portfolio,
+        )
         
         sync_rows = await conn.fetch(
             """
@@ -646,6 +655,7 @@ async def get_public_dashboard(
                     "portfolio": portfolio,
                     "summary": dict(summary_rows[0]) if summary_rows else None,
                     "nav_by_broker": [dict(row) for row in nav_rows],
+                    "performance": dict(performance_row) if performance_row else None,
                     "allocation": {
                         "asset_class": [dict(row) for row in allocation_asset_class_rows],
                         "broker": [dict(row) for row in allocation_broker_rows],
