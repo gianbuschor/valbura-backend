@@ -1131,9 +1131,20 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
 
             current_ytd = ibkr_cashflow["ytd_deposit_withdrawals"]
 
-            if previous_cashflow and previous_cashflow["raw_payload"]:
+                if previous_cashflow and previous_cashflow["raw_payload"]:
+                previous_raw_payload = previous_cashflow["raw_payload"]
+
+                if isinstance(previous_raw_payload, str):
+                    try:
+                        previous_raw_payload = json.loads(previous_raw_payload)
+                    except Exception:
+                        previous_raw_payload = {}
+
+                if previous_raw_payload is None:
+                    previous_raw_payload = {}
+
                 previous_ytd = parse_decimal(
-                    previous_cashflow["raw_payload"].get("current_ytd_deposit_withdrawals"),
+                    previous_raw_payload.get("current_ytd_deposit_withdrawals"),
                     0,
                 )
                 cashflow_delta = current_ytd - previous_ytd
