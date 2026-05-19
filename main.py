@@ -1519,17 +1519,17 @@ async def bitget_get(path: str, params: dict):
 
 async def fetch_bitget_tpsl_map(product_type: str):
     """
-    Fetch active Bitget TP/SL plan orders and map them by (symbol, hold_side).
-
     Returns:
-        {
-            ("SUIUSDT", "long"): {
-                "take_profit": 1.4559,
-                "stop_loss": 0.8798,
-                "take_profit_order_id": "...",
-                "stop_loss_order_id": "...",
-            }
+    {
+        ("SUIUSDT", "long"): {
+            "take_profit": Decimal(...),
+            "stop_loss": Decimal(...),
+            "take_profit_order_id": "...",
+            "stop_loss_order_id": "...",
+            "take_profit_orders": [...],
+            "stop_loss_orders": [...],
         }
+    }
     """
     result = {}
 
@@ -1563,6 +1563,8 @@ async def fetch_bitget_tpsl_map(product_type: str):
                 "stop_loss": None,
                 "take_profit_order_id": None,
                 "stop_loss_order_id": None,
+                "take_profit_orders": [],
+                "stop_loss_orders": [],
             }
 
         plan_type = order.get("planType")
@@ -1573,6 +1575,7 @@ async def fetch_bitget_tpsl_map(product_type: str):
             or order.get("triggerPrice")
             or None
         )
+
         sl_raw = (
             order.get("stopLossTriggerPrice")
             or order.get("stopLoss")
@@ -1580,13 +1583,54 @@ async def fetch_bitget_tpsl_map(product_type: str):
             or None
         )
 
+        size_raw = order.get("size")
+        order_id = order.get("orderId") or None
+
         if plan_type == "profit_plan" and tp_raw:
-            result[key]["take_profit"] = parse_decimal(tp_raw, None)
-            result[key]["take_profit_order_id"] = order.get("orderId") or None
+            tp_price = parse_decimal(tp_raw, None)
+
+            tp_order = {
+                "price": float(tp_price) if tp_price is not None else None,
+                "size": float(parse_decimal(size_raw, 0)) if size_raw is not None else None,
+                "order_id": order_id,
+                "client_oid": order.get("clientOid") or None,
+                "plan_type": plan_type,
+                "trigger_type": order.get("triggerType") or None,
+                "order_type": order.get("orderType") or None,
+                "trade_side": order.get("tradeSide") or None,
+                "status": order.get("planStatus") or None,
+                "created_at_ms": order.get("cTime") or None,
+                "updated_at_ms": order.get("uTime") or None,
+            }
+
+            result[key]["take_profit_orders"].append(tp_order)
+
+            if result[key]["take_profit"] is None:
+                result[key]["take_profit"] = tp_price
+                result[key]["take_profit_order_id"] = order_id
 
         if plan_type == "pos_loss" and sl_raw:
-            result[key]["stop_loss"] = parse_decimal(sl_raw, None)
-            result[key]["stop_loss_order_id"] = order.get("orderId") or None
+            sl_price = parse_decimal(sl_raw, None)
+
+            sl_order = {
+                "price": float(sl_price) if sl_price is not None else None,
+                "size": float(parse_decimal(size_raw, 0)) if size_raw is not None else None,
+                "order_id": order_id,
+                "client_oid": order.get("clientOid") or None,
+                "plan_type": plan_type,
+                "trigger_type": order.get("triggerType") or None,
+                "order_type": order.get("orderType") or None,
+                "trade_side": order.get("tradeSide") or None,
+                "status": order.get("planStatus") or None,
+                "created_at_ms": order.get("cTime") or None,
+                "updated_at_ms": order.get("uTime") or None,
+            }
+
+            result[key]["stop_loss_orders"].append(sl_order)
+
+            if result[key]["stop_loss"] is None:
+                result[key]["stop_loss"] = sl_price
+                result[key]["stop_loss_order_id"] = order_id
 
     return result
 
@@ -1916,6 +1960,9 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
         market_value_base = market_value_native
         open_pnl_base = open_pnl_native
 
+        take_profit_orders = tpsl.get("take_profit_orders") or []
+        stop_loss_orders = tpsl.get("stop_loss_orders") or []
+
         await conn.execute(
             """
             INSERT INTO public.positions (
@@ -1927,7 +1974,9 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
                 take_profit, stop_loss,
                 take_profit_order_id, stop_loss_order_id,
                 source_position_id,
-                updated_at
+                updated_at,
+                take_profit_orders,
+                stop_loss_orders
             )
             VALUES (
                 $1, 'Bitget', $2, 'Crypto Futures',
@@ -1938,7 +1987,9 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
                 $12, $13,
                 $14, $15,
                 $16,
-                now()
+                now(),
+                $17::jsonb,
+                $18::jsonb
             )
             ON CONFLICT (portfolio_id, broker, symbol)
             DO UPDATE SET
@@ -1958,7 +2009,9 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
                 take_profit_order_id = EXCLUDED.take_profit_order_id,
                 stop_loss_order_id = EXCLUDED.stop_loss_order_id,
                 source_position_id = EXCLUDED.source_position_id,
-                updated_at = now()
+                updated_at = now(),
+                take_profit_orders = EXCLUDED.take_profit_orders,
+                stop_loss_orders = EXCLUDED.stop_loss_orders
             """,
             portfolio_id,
             symbol,
@@ -1976,6 +2029,8 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
             take_profit_order_id,
             stop_loss_order_id,
             source_position_id,
+            json.dumps(take_profit_orders),
+            json.dumps(stop_loss_orders),
         )
 
         positions_inserted += 1
