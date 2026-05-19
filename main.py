@@ -956,6 +956,46 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
 
     market_value = nav - cash
 
+    # --- IBKR cashflow from CashReportCurrency BASE_SUMMARY ---
+    # In many Flex reports this is YTD/cumulative. Therefore:
+    # - first import stores the current cumulative value as initial cashflow at fromDate
+    # - later imports store only the delta versus the last imported cumulative value
+    ibkr_cashflow = None
+
+    for elem in root.iter():
+        if elem.tag.lower().endswith("cashreportcurrency"):
+            data = elem.attrib
+            cash_currency = data.get("currency")
+
+            if cash_currency != "BASE_SUMMARY":
+                continue
+
+            from_date_raw = data.get("fromDate")
+            to_date_raw = data.get("toDate")
+            deposit_withdrawals = parse_decimal(data.get("depositWithdrawals"), 0)
+
+            if not to_date_raw:
+                continue
+
+            try:
+                from_date = parse_dt(from_date_raw).date() if from_date_raw else snapshot_date
+            except Exception:
+                from_date = snapshot_date
+
+            try:
+                to_date = parse_dt(to_date_raw).date()
+            except Exception:
+                to_date = snapshot_date
+
+            ibkr_cashflow = {
+                "from_date": from_date,
+                "to_date": to_date,
+                "currency": currency,
+                "ytd_deposit_withdrawals": deposit_withdrawals,
+                "raw_payload": data,
+            }
+            break
+
     # Build all position rows first. This avoids deleting existing positions if
     # parsing/insertion would fail halfway through.
     position_rows = []
@@ -1018,6 +1058,8 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             })
 
     positions_inserted = 0
+    cashflow_imported = False
+    cashflow_amount_base = None
 
     async with conn.transaction():
         await conn.execute(
@@ -1030,7 +1072,7 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             VALUES (
                 $1, 'IBKR', $2, $3,
                 $4, $5, $6, $7, NULL,
-                NULL, 'ibkr_flex_equity_summary'
+                $8, 'ibkr_flex_equity_summary'
             )
             ON CONFLICT (portfolio_id, broker, snapshot_date, currency)
             DO UPDATE SET
@@ -1038,6 +1080,7 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
                 cash = EXCLUDED.cash,
                 market_value = EXCLUDED.market_value,
                 open_pnl = EXCLUDED.open_pnl,
+                deposits_withdrawals = EXCLUDED.deposits_withdrawals,
                 source = EXCLUDED.source,
                 created_at = now()
             """,
@@ -1048,6 +1091,7 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             cash,
             market_value,
             open_pnl,
+            ibkr_cashflow["ytd_deposit_withdrawals"] if ibkr_cashflow else None,
         )
 
         await conn.execute(
@@ -1067,6 +1111,86 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             currency,
             cash,
         )
+
+        # Import IBKR cashflow delta from YTD CashReportCurrency BASE_SUMMARY.
+        if ibkr_cashflow is not None:
+            previous_cashflow = await conn.fetchrow(
+                """
+                SELECT
+                    cashflow_date,
+                    raw_payload
+                FROM public.portfolio_cashflows
+                WHERE portfolio_id = $1
+                  AND broker = 'IBKR'
+                  AND source = 'ibkr_cash_report_ytd_delta'
+                ORDER BY cashflow_date DESC, created_at DESC
+                LIMIT 1
+                """,
+                portfolio_id,
+            )
+
+            current_ytd = ibkr_cashflow["ytd_deposit_withdrawals"]
+
+            if previous_cashflow and previous_cashflow["raw_payload"]:
+                previous_ytd = parse_decimal(
+                    previous_cashflow["raw_payload"].get("current_ytd_deposit_withdrawals"),
+                    0,
+                )
+                cashflow_delta = current_ytd - previous_ytd
+                cashflow_date = ibkr_cashflow["to_date"]
+            else:
+                previous_ytd = 0
+                cashflow_delta = current_ytd
+                cashflow_date = ibkr_cashflow["from_date"]
+
+            if cashflow_delta != 0:
+                external_id = f"IBKR:{portfolio_name}:cash_report_ytd_delta:{cashflow_date.isoformat()}"
+
+                raw_payload = {
+                    "from_date": ibkr_cashflow["from_date"].isoformat(),
+                    "to_date": ibkr_cashflow["to_date"].isoformat(),
+                    "current_ytd_deposit_withdrawals": str(current_ytd),
+                    "previous_ytd_deposit_withdrawals": str(previous_ytd),
+                    "cashflow_delta": str(cashflow_delta),
+                    "cash_report": ibkr_cashflow["raw_payload"],
+                }
+
+                await conn.execute(
+                    """
+                    INSERT INTO public.portfolio_cashflows (
+                        portfolio_id, broker, cashflow_date, currency,
+                        amount_native, amount_base,
+                        cashflow_type, source, external_id, raw_payload,
+                        updated_at
+                    )
+                    VALUES (
+                        $1, 'IBKR', $2, $3,
+                        $4, $4,
+                        'NET_DEPOSIT_WITHDRAWAL',
+                        'ibkr_cash_report_ytd_delta',
+                        $5, $6::jsonb,
+                        now()
+                    )
+                    ON CONFLICT (portfolio_id, broker, source, external_id)
+                    DO UPDATE SET
+                        cashflow_date = EXCLUDED.cashflow_date,
+                        currency = EXCLUDED.currency,
+                        amount_native = EXCLUDED.amount_native,
+                        amount_base = EXCLUDED.amount_base,
+                        cashflow_type = EXCLUDED.cashflow_type,
+                        raw_payload = EXCLUDED.raw_payload,
+                        updated_at = now()
+                    """,
+                    portfolio_id,
+                    cashflow_date,
+                    currency,
+                    cashflow_delta,
+                    external_id,
+                    json.dumps(raw_payload),
+                )
+
+                cashflow_imported = True
+                cashflow_amount_base = cashflow_delta
 
         # Replace only this portfolio's IBKR positions after parsing succeeded.
         await conn.execute(
@@ -1090,7 +1214,9 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
                     take_profit, stop_loss,
                     take_profit_order_id, stop_loss_order_id,
                     source_position_id,
-                    updated_at
+                    updated_at,
+                    take_profit_orders,
+                    stop_loss_orders
                 )
                 VALUES (
                     $1, 'IBKR', $2, $3,
@@ -1101,7 +1227,9 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
                     NULL, NULL,
                     NULL, NULL,
                     $14,
-                    now()
+                    now(),
+                    '[]'::jsonb,
+                    '[]'::jsonb
                 )
                 ON CONFLICT (portfolio_id, broker, symbol)
                 DO UPDATE SET
@@ -1121,6 +1249,8 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
                     take_profit_order_id = EXCLUDED.take_profit_order_id,
                     stop_loss_order_id = EXCLUDED.stop_loss_order_id,
                     source_position_id = EXCLUDED.source_position_id,
+                    take_profit_orders = EXCLUDED.take_profit_orders,
+                    stop_loss_orders = EXCLUDED.stop_loss_orders,
                     updated_at = now()
                 """,
                 portfolio_id,
@@ -1153,6 +1283,8 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
         "positions_inserted": positions_inserted,
         "total_position_value_base": total_position_value_base,
         "total_open_pnl_base": total_open_pnl_base,
+        "cashflow_imported": cashflow_imported,
+        "cashflow_amount_base": cashflow_amount_base,
     }
 
 async def upsert_ibkr_realized_pnl(conn, portfolio_name: str, xml_text: str):
