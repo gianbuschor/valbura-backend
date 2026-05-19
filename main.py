@@ -1848,6 +1848,67 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
         "positions_inserted": positions_inserted,
     }
 
+@app.post("/debug/bitget/tpsl")
+async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
+
+    # Wir testen mehrere mögliche Bitget-Endpunkte/Plan-Typen,
+    # weil TP/SL je nach Order-Art nicht direkt an der Position hängt.
+    plan_types = [
+        "normal_plan",
+        "track_plan",
+        "profit_loss",
+        "profit_plan",
+        "loss_plan",
+        "pos_profit",
+        "pos_loss",
+    ]
+
+    results = {}
+
+    for product_type in product_types:
+        product_result = {}
+
+        # 1) Aktive Pending Orders
+        try:
+            product_result["orders_pending"] = await bitget_request(
+                "GET",
+                "/api/v2/mix/order/orders-pending",
+                {
+                    "productType": product_type,
+                },
+            )
+        except Exception as e:
+            product_result["orders_pending_error"] = str(e)
+
+        # 2) Pending Plan Orders mit verschiedenen planType-Werten
+        product_result["plan_orders"] = {}
+
+        for plan_type in plan_types:
+            try:
+                product_result["plan_orders"][plan_type] = await bitget_request(
+                    "GET",
+                    "/api/v2/mix/order/orders-plan-pending",
+                    {
+                        "productType": product_type,
+                        "planType": plan_type,
+                    },
+                )
+            except Exception as e:
+                product_result["plan_orders"][f"{plan_type}_error"] = str(e)
+
+        results[product_type] = product_result
+
+    return JSONResponse(content=json_safe({
+        "status": "success",
+        "results": results,
+    }))
+
 
 @app.post("/sync/bitget")
 async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
