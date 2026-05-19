@@ -324,6 +324,41 @@ async def get_positions(portfolio: Optional[str] = None):
     finally:
         await conn.close()
 
+@app.get("/public/closed-positions")
+async def get_public_closed_positions(
+    portfolio: Optional[str] = None,
+    limit: int = 200,
+):
+    conn = await get_conn()
+    try:
+        if portfolio:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.v_closed_positions_public
+                WHERE portfolio_name = $1
+                ORDER BY closed_pnl_base DESC NULLS LAST
+                LIMIT $2
+                """,
+                portfolio,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.v_closed_positions_public
+                ORDER BY portfolio_name, closed_pnl_base DESC NULLS LAST
+                LIMIT $1
+                """,
+                limit,
+            )
+
+        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+
+    finally:
+        await conn.close()
+
 
 @app.get("/public/nav")
 async def get_nav(portfolio: Optional[str] = None):
@@ -411,7 +446,11 @@ async def get_position_allocation(portfolio: str, group_by: str = "asset_class")
         await conn.close()
 
 @app.get("/public/dashboard")
-async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
+async def get_public_dashboard(
+    portfolio: str,
+    trade_limit: int = 25,
+    closed_limit: int = 100,
+):
     conn = await get_conn()
     try:
         summary_rows = await conn.fetch(
@@ -485,6 +524,18 @@ async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
             trade_limit,
         )
 
+        closed_position_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.v_closed_positions_public
+            WHERE portfolio_name = $1
+            ORDER BY closed_pnl_base DESC NULLS LAST
+            LIMIT $2
+            """,
+            portfolio,
+            closed_limit,
+        )
+        
         sync_rows = await conn.fetch(
             """
             SELECT DISTINCT ON (broker)
@@ -554,6 +605,7 @@ async def get_public_dashboard(portfolio: str, trade_limit: int = 25):
                     },
                     "positions": [dict(row) for row in position_rows],
                     "recent_trades": [dict(row) for row in trade_rows],
+                    "closed_positions": [dict(row) for row in closed_position_rows],
                     "sync_status": [dict(row) for row in sync_rows],
                     "sync_errors": [dict(row) for row in sync_error_rows],
                 }
