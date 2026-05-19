@@ -1468,6 +1468,80 @@ async def bitget_get(path: str, params: dict):
             raise RuntimeError(f"Bitget API error: {data}")
         return data
 
+async def fetch_bitget_tpsl_map(product_type: str):
+    """
+    Fetch active Bitget TP/SL plan orders and map them by (symbol, hold_side).
+
+    Returns:
+        {
+            ("SUIUSDT", "long"): {
+                "take_profit": 1.4559,
+                "stop_loss": 0.8798,
+                "take_profit_order_id": "...",
+                "stop_loss_order_id": "...",
+            }
+        }
+    """
+    result = {}
+
+    try:
+        response = await bitget_get(
+            "/api/v2/mix/order/orders-plan-pending",
+            {
+                "productType": product_type,
+                "planType": "profit_loss",
+            },
+        )
+    except Exception as e:
+        print(f"Bitget TP/SL fetch failed for {product_type}: {e}")
+        return result
+
+    data = response.get("data") or {}
+    orders = data.get("entrustedList") or []
+
+    for order in orders:
+        symbol = order.get("symbol")
+        pos_side = (order.get("posSide") or "").lower()
+
+        if not symbol or not pos_side:
+            continue
+
+        key = (symbol, pos_side)
+
+        if key not in result:
+            result[key] = {
+                "take_profit": None,
+                "stop_loss": None,
+                "take_profit_order_id": None,
+                "stop_loss_order_id": None,
+            }
+
+        plan_type = order.get("planType")
+
+        tp_raw = (
+            order.get("stopSurplusTriggerPrice")
+            or order.get("takeProfit")
+            or order.get("triggerPrice")
+            or None
+        )
+        sl_raw = (
+            order.get("stopLossTriggerPrice")
+            or order.get("stopLoss")
+            or order.get("triggerPrice")
+            or None
+        )
+
+        if plan_type == "profit_plan" and tp_raw:
+            result[key]["take_profit"] = parse_decimal(tp_raw, None)
+            result[key]["take_profit_order_id"] = order.get("orderId") or None
+
+        if plan_type == "pos_loss" and sl_raw:
+            result[key]["stop_loss"] = parse_decimal(sl_raw, None)
+            result[key]["stop_loss_order_id"] = order.get("orderId") or None
+
+    return result
+
+
 @app.post("/debug/bitget/account")
 async def debug_bitget_account(x_admin_token: Optional[str] = Header(None)):
     try:
@@ -1640,6 +1714,10 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
         },
     )
 
+    # TP/SL orders are not always attached directly to the position.
+    # Bitget exposes active TP/SL through plan orders with planType=profit_loss.
+    tpsl_map = await fetch_bitget_tpsl_map(product_type)
+
     accounts = account_data.get("data") or []
     if isinstance(accounts, dict):
         accounts = [accounts]
@@ -1751,10 +1829,27 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
         mark_price = parse_decimal(pos.get("markPrice"), 0)
         open_pnl_native = parse_decimal(pos.get("unrealizedPL"), 0)
 
-        take_profit = parse_decimal(pos.get("takeProfit"), None)
-        stop_loss = parse_decimal(pos.get("stopLoss"), None)
-        take_profit_order_id = pos.get("takeProfitId") or None
-        stop_loss_order_id = pos.get("stopLossId") or None
+        tpsl = tpsl_map.get((symbol, hold_side), {})
+
+        take_profit = (
+            parse_decimal(pos.get("takeProfit"), None)
+            or tpsl.get("take_profit")
+        )
+        stop_loss = (
+            parse_decimal(pos.get("stopLoss"), None)
+            or tpsl.get("stop_loss")
+        )
+        take_profit_order_id = (
+            pos.get("takeProfitId")
+            or tpsl.get("take_profit_order_id")
+            or None
+        )
+        stop_loss_order_id = (
+            pos.get("stopLossId")
+            or tpsl.get("stop_loss_order_id")
+            or None
+        )
+
         source_position_id = (
             pos.get("posId")
             or pos.get("positionId")
@@ -1846,7 +1941,9 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
         "open_pnl": open_pnl,
         "positions_seen": positions_seen,
         "positions_inserted": positions_inserted,
+        "tpsl_orders_seen": len(tpsl_map),
     }
+
 
 @app.post("/debug/bitget/tpsl")
 async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
