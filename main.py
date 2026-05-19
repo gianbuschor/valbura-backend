@@ -2575,6 +2575,9 @@ async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = H
             market_value_native = abs(volume * price_current)
             open_pnl_native = position_profit
 
+            take_profit_orders = pos.get("take_profit_orders") or []
+            stop_loss_orders = pos.get("stop_loss_orders") or []
+
             await conn.execute(
                 """
                 INSERT INTO public.positions (
@@ -2586,7 +2589,9 @@ async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = H
                     take_profit, stop_loss,
                     take_profit_order_id, stop_loss_order_id,
                     source_position_id,
-                    updated_at
+                    updated_at,
+                    take_profit_orders,
+                    stop_loss_orders
                 )
                 VALUES (
                     $1, 'MT5', $2, 'Index',
@@ -2597,7 +2602,9 @@ async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = H
                     $11, $12,
                     NULL, NULL,
                     $13,
-                    now()
+                    now(),
+                    $14::jsonb,
+                    $15::jsonb
                 )
                 ON CONFLICT (portfolio_id, broker, symbol)
                 DO UPDATE SET
@@ -2614,6 +2621,8 @@ async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = H
                     take_profit = EXCLUDED.take_profit,
                     stop_loss = EXCLUDED.stop_loss,
                     source_position_id = EXCLUDED.source_position_id,
+                    take_profit_orders = EXCLUDED.take_profit_orders,
+                    stop_loss_orders = EXCLUDED.stop_loss_orders,
                     updated_at = now()
                 """,
                 portfolio_id,
@@ -2629,8 +2638,9 @@ async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = H
                 take_profit,
                 stop_loss,
                 source_position_id,
+                json.dumps(take_profit_orders),
+                json.dumps(stop_loss_orders),
             )
-
             rows_inserted += 1
 
         await finish_import_job(
