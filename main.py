@@ -2457,6 +2457,7 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
         rows_seen = 0
         rows_inserted = 0
         rows_updated = 0
+        cashflows_seen = 0
 
         for deal in payload:
             rows_seen += 1
@@ -2483,6 +2484,68 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
             except Exception:
                 trade_time = datetime.now(timezone.utc)
 
+            # MT5 external cashflows.
+            # MT5 balance/deposit/withdrawal deals usually have type=2 or type='balance',
+            # often no symbol, no volume and the amount in profit.
+            deal_type_raw = str(deal.get("type") or "").strip().lower()
+            deal_comment = str(deal.get("comment") or "").strip()
+            account_currency = deal.get("account_currency") or "USD"
+
+            is_balance_cashflow = (
+                deal_type_raw in ["2", "balance"]
+                or (
+                    not deal.get("symbol")
+                    and quantity == 0
+                    and price == 0
+                    and profit != 0
+                    and "balance" in deal_comment.lower()
+                )
+            )
+
+            if is_balance_cashflow:
+                cashflows_seen += 1
+
+                amount_native = profit
+                cashflow_type = "DEPOSIT" if amount_native > 0 else "WITHDRAWAL"
+                cashflow_external_id = f"MT5:Day Trading:cashflow:{external_id}"
+
+                await conn.execute(
+                    """
+                    INSERT INTO public.portfolio_cashflows (
+                        portfolio_id, broker, cashflow_date, currency,
+                        amount_native, amount_base,
+                        cashflow_type, source, external_id, raw_payload,
+                        updated_at
+                    )
+                    VALUES (
+                        $1, 'MT5', $2, $3,
+                        $4, $4,
+                        $5, 'mt5_deal_balance',
+                        $6, $7::jsonb,
+                        now()
+                    )
+                    ON CONFLICT (portfolio_id, broker, source, external_id)
+                    DO UPDATE SET
+                        cashflow_date = EXCLUDED.cashflow_date,
+                        currency = EXCLUDED.currency,
+                        amount_native = EXCLUDED.amount_native,
+                        amount_base = EXCLUDED.amount_base,
+                        cashflow_type = EXCLUDED.cashflow_type,
+                        raw_payload = EXCLUDED.raw_payload,
+                        updated_at = now()
+                    """,
+                    portfolio_id,
+                    trade_time.date(),
+                    account_currency,
+                    amount_native,
+                    cashflow_type,
+                    cashflow_external_id,
+                    json.dumps(deal),
+                )
+
+                # Do not import deposits/withdrawals as trades or realized PnL.
+                continue
+            
             existing_trade = await conn.fetchrow(
                 """
                 SELECT id
@@ -2568,6 +2631,9 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
             rows_seen=rows_seen,
             rows_inserted=rows_inserted,
             rows_updated=rows_updated,
+            metadata={
+                "cashflows_seen": cashflows_seen,
+            },
         )
 
         return JSONResponse(
@@ -2577,6 +2643,7 @@ async def sync_mt5_deals(request: Request, x_valbura_token: Optional[str] = Head
                 "rows_seen": rows_seen,
                 "rows_inserted": rows_inserted,
                 "rows_updated": rows_updated,
+                "cashflows_seen": cashflows_seen,
             }
         )
 
