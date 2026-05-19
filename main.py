@@ -2241,6 +2241,29 @@ async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = H
             price_current = parse_decimal(pos.get("price_current"), 0)
             position_profit = parse_decimal(pos.get("profit"), 0)
 
+            position_type = str(pos.get("type") or pos.get("position_type") or "").lower()
+            position_side = None
+            if position_type in ["0", "buy", "long"]:
+                position_side = "LONG"
+            elif position_type in ["1", "sell", "short"]:
+                position_side = "SHORT"
+                volume = -abs(volume)
+
+            take_profit = parse_decimal(pos.get("tp"), None)
+            stop_loss = parse_decimal(pos.get("sl"), None)
+            source_position_id = str(pos.get("ticket") or pos.get("identifier") or pos.get("position_id") or symbol)
+
+            entry_time_raw = pos.get("time") or pos.get("time_msc")
+            try:
+                if entry_time_raw and int(entry_time_raw) > 10_000_000_000:
+                    entry_date = datetime.fromtimestamp(int(entry_time_raw) / 1000, tz=timezone.utc)
+                elif entry_time_raw:
+                    entry_date = datetime.fromtimestamp(int(entry_time_raw), tz=timezone.utc)
+                else:
+                    entry_date = None
+            except Exception:
+                entry_date = None
+
             market_value_native = abs(volume * price_current)
             open_pnl_native = position_profit
 
@@ -2250,13 +2273,23 @@ async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = H
                     portfolio_id, broker, symbol, asset_class,
                     quantity, avg_cost, currency, market_price,
                     market_value_native, market_value_base,
-                    open_pnl_native, open_pnl_base, updated_at
+                    open_pnl_native, open_pnl_base,
+                    entry_date, position_side,
+                    take_profit, stop_loss,
+                    take_profit_order_id, stop_loss_order_id,
+                    source_position_id,
+                    updated_at
                 )
                 VALUES (
                     $1, 'MT5', $2, 'Index',
                     $3, $4, $5, $6,
                     $7, $7,
-                    $8, $8, now()
+                    $8, $8,
+                    $9, $10,
+                    $11, $12,
+                    NULL, NULL,
+                    $13,
+                    now()
                 )
                 ON CONFLICT (portfolio_id, broker, symbol)
                 DO UPDATE SET
@@ -2268,6 +2301,11 @@ async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = H
                     market_value_base = EXCLUDED.market_value_base,
                     open_pnl_native = EXCLUDED.open_pnl_native,
                     open_pnl_base = EXCLUDED.open_pnl_base,
+                    entry_date = EXCLUDED.entry_date,
+                    position_side = EXCLUDED.position_side,
+                    take_profit = EXCLUDED.take_profit,
+                    stop_loss = EXCLUDED.stop_loss,
+                    source_position_id = EXCLUDED.source_position_id,
                     updated_at = now()
                 """,
                 portfolio_id,
@@ -2278,6 +2316,11 @@ async def sync_mt5_snapshot(request: Request, x_valbura_token: Optional[str] = H
                 price_current,
                 market_value_native,
                 open_pnl_native,
+                entry_date,
+                position_side,
+                take_profit,
+                stop_loss,
+                source_position_id,
             )
 
             rows_inserted += 1
