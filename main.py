@@ -183,6 +183,68 @@ def parse_dt(value):
         return datetime.now(timezone.utc)
 
 
+async def get_fx_rate(
+    conn,
+    from_currency: str,
+    to_currency: str,
+    rate_date,
+) -> Optional[float]:
+    """
+    Return the FX rate (from_currency → to_currency) for a given date.
+
+    Rules:
+    - USDC is treated as USDT (both are USD stablecoins; USDT rates cover both).
+    - Returns 1.0 when from_currency == to_currency (after normalisation).
+    - Tries an exact match on rate_date first.
+    - Falls back to the most-recent rate on or before rate_date.
+    - Returns None when no rate is found at all; the caller must handle this.
+    """
+    # Normalise stablecoins
+    if from_currency == "USDC":
+        from_currency = "USDT"
+    if to_currency == "USDC":
+        to_currency = "USDT"
+
+    if from_currency == to_currency:
+        return 1.0
+
+    # 1. Exact date match
+    row = await conn.fetchrow(
+        """
+        SELECT rate
+        FROM public.fx_rates
+        WHERE from_currency = $1
+          AND to_currency   = $2
+          AND rate_date     = $3
+        """,
+        from_currency,
+        to_currency,
+        rate_date,
+    )
+    if row:
+        return float(row["rate"])
+
+    # 2. Last known rate on or before the requested date
+    row = await conn.fetchrow(
+        """
+        SELECT rate
+        FROM public.fx_rates
+        WHERE from_currency = $1
+          AND to_currency   = $2
+          AND rate_date    <= $3
+        ORDER BY rate_date DESC
+        LIMIT 1
+        """,
+        from_currency,
+        to_currency,
+        rate_date,
+    )
+    if row:
+        return float(row["rate"])
+
+    return None
+
+
 # -------------------------
 # Public endpoints
 # -------------------------
@@ -2202,6 +2264,213 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
     }
 
 
+async def upsert_bitget_cashflows(
+    conn,
+    portfolio_name: str,
+    portfolio_id,
+    base_currency: str,
+) -> dict:
+    """
+    Import Bitget deposits and withdrawals into portfolio_cashflows.
+
+    Strategy:
+    - Loops in 90-day windows from 2024-01-01 to today.
+    - Uses idLessThan cursor pagination within each window (newest → oldest).
+    - Only records with status='success' are imported.
+    - Deposits  → positive amount_native (money entering portfolio).
+    - Withdrawals → negative amount_native = -(size - fee), consistent with MT5.
+    - amount_base = amount_native * FX rate (coin → base_currency).
+    - If no FX rate is found: amount_base = NULL, warning is printed.
+    """
+    today = datetime.now(timezone.utc).date()
+    window_start = date(2024, 1, 1)
+
+    cashflows_seen = 0
+    cashflows_inserted = 0
+    cashflows_updated = 0
+    cashflows_skipped_no_fx = 0
+
+    endpoints = [
+        (
+            "/api/v2/spot/wallet/deposit-records",
+            "DEPOSIT",
+            "bitget_deposit_record",
+        ),
+        (
+            "/api/v2/spot/wallet/withdrawal-records",
+            "WITHDRAWAL",
+            "bitget_withdrawal_record",
+        ),
+    ]
+
+    for api_path, cashflow_type, source_key in endpoints:
+        current_start = window_start
+
+        while current_start <= today:
+            current_end = min(current_start + timedelta(days=89), today)
+
+            start_ms = str(int(
+                datetime(
+                    current_start.year,
+                    current_start.month,
+                    current_start.day,
+                    tzinfo=timezone.utc,
+                ).timestamp() * 1000
+            ))
+            end_ms = str(int(
+                datetime(
+                    current_end.year,
+                    current_end.month,
+                    current_end.day,
+                    23, 59, 59,
+                    tzinfo=timezone.utc,
+                ).timestamp() * 1000
+            ))
+
+            id_less_than = None
+
+            while True:
+                params: dict = {
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                    "limit": "100",
+                }
+                if id_less_than is not None:
+                    params["idLessThan"] = id_less_than
+
+                data = await bitget_get(api_path, params)
+                records = data.get("data") or []
+                if isinstance(records, dict):
+                    records = (
+                        records.get("depositList")
+                        or records.get("withdrawList")
+                        or records.get("list")
+                        or []
+                    )
+
+                if not records:
+                    break
+
+                for record in records:
+                    cashflows_seen += 1
+
+                    status = (record.get("status") or "").lower()
+                    if status != "success":
+                        continue
+
+                    order_id = record.get("orderId") or record.get("id") or ""
+                    coin = (record.get("coin") or "USDT").upper()
+                    size = parse_decimal(record.get("size"), 0)
+
+                    ctime_ms = record.get("cTime")
+                    try:
+                        cashflow_dt = datetime.fromtimestamp(
+                            int(ctime_ms) / 1000, tz=timezone.utc
+                        )
+                    except Exception:
+                        cashflow_dt = datetime.now(timezone.utc)
+
+                    cashflow_date = cashflow_dt.date()
+
+                    if cashflow_type == "DEPOSIT":
+                        amount_native = size
+                        external_id = f"Bitget:{portfolio_name}:deposit:{order_id}"
+                    else:
+                        # Withdrawal: net = gross - fee; stored negative (money out).
+                        fee = parse_decimal(record.get("fee") or "0", 0)
+                        amount_native = -(size - fee)
+                        external_id = f"Bitget:{portfolio_name}:withdrawal:{order_id}"
+
+                    # FX conversion: coin → portfolio base currency
+                    fx_rate = await get_fx_rate(conn, coin, base_currency, cashflow_date)
+
+                    if fx_rate is None:
+                        amount_base = None
+                        cashflows_skipped_no_fx += 1
+                        print(
+                            f"[Bitget cashflow] No FX rate: {coin}→{base_currency} "
+                            f"on {cashflow_date} | {external_id}"
+                        )
+                    else:
+                        amount_base = amount_native * fx_rate
+
+                    # Track insert vs. update for counters
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT id FROM public.portfolio_cashflows
+                        WHERE portfolio_id = $1
+                          AND broker       = 'Bitget'
+                          AND source       = $2
+                          AND external_id  = $3
+                        """,
+                        portfolio_id,
+                        source_key,
+                        external_id,
+                    )
+
+                    await conn.execute(
+                        """
+                        INSERT INTO public.portfolio_cashflows (
+                            portfolio_id, broker, cashflow_date, currency,
+                            amount_native, amount_base,
+                            cashflow_type, source, external_id, raw_payload,
+                            updated_at
+                        )
+                        VALUES (
+                            $1, 'Bitget', $2, $3,
+                            $4, $5,
+                            $6, $7, $8, $9::jsonb,
+                            now()
+                        )
+                        ON CONFLICT (portfolio_id, broker, source, external_id)
+                        DO UPDATE SET
+                            cashflow_date = EXCLUDED.cashflow_date,
+                            currency      = EXCLUDED.currency,
+                            amount_native = EXCLUDED.amount_native,
+                            amount_base   = EXCLUDED.amount_base,
+                            cashflow_type = EXCLUDED.cashflow_type,
+                            raw_payload   = EXCLUDED.raw_payload,
+                            updated_at    = now()
+                        """,
+                        portfolio_id,
+                        cashflow_date,
+                        coin,
+                        amount_native,
+                        amount_base,
+                        cashflow_type,
+                        source_key,
+                        external_id,
+                        json.dumps(record),
+                    )
+
+                    if existing:
+                        cashflows_updated += 1
+                    else:
+                        cashflows_inserted += 1
+
+                # Cursor pagination: fewer than 100 records means last page.
+                if len(records) < 100:
+                    break
+
+                # Next page: pass the smallest orderId as idLessThan.
+                try:
+                    id_less_than = str(
+                        min(int(r.get("orderId") or "0") for r in records)
+                    )
+                except Exception:
+                    break
+
+            current_start = current_end + timedelta(days=1)
+
+    return {
+        "portfolio": portfolio_name,
+        "cashflows_seen": cashflows_seen,
+        "cashflows_inserted": cashflows_inserted,
+        "cashflows_updated": cashflows_updated,
+        "cashflows_skipped_no_fx": cashflows_skipped_no_fx,
+    }
+
+
 @app.post("/debug/bitget/tpsl")
 async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
     try:
@@ -2272,6 +2541,7 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
         total_inserted = 0
         total_updated = 0
         results = []
+        cashflow_results = []
 
         product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
 
@@ -2283,6 +2553,16 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 portfolio_name,
                 {"product_types": product_types},
             )
+
+            # Resolve portfolio_id and base_currency from DB (not hardcoded).
+            portfolio_row = await conn.fetchrow(
+                "SELECT id, base_currency FROM public.portfolios WHERE name = $1",
+                portfolio_name,
+            )
+            if not portfolio_row:
+                raise RuntimeError(f"Portfolio not found: {portfolio_name}")
+            portfolio_id = portfolio_row["id"]
+            base_currency = portfolio_row["base_currency"]
 
             portfolio_seen = 0
             portfolio_inserted = 0
@@ -2310,6 +2590,15 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 portfolio_updated += result["rows_updated"]
                 results.append(result)
 
+            # A2.1 — import deposits and withdrawals
+            cashflow_result = await upsert_bitget_cashflows(
+                conn,
+                portfolio_name,
+                portfolio_id,
+                base_currency,
+            )
+            cashflow_results.append(cashflow_result)
+
             snapshot_result = await upsert_bitget_snapshot_and_positions(conn, portfolio_name)
 
             await finish_import_job(
@@ -2321,6 +2610,7 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 rows_updated=portfolio_updated,
                 metadata={
                     "results": results,
+                    "cashflows": cashflow_result,
                     "snapshot": snapshot_result,
                 },
             )
@@ -2337,7 +2627,8 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 "rows_inserted": total_inserted,
                 "rows_updated": total_updated,
                 "results": results,
-             }
+                "cashflows": cashflow_results,
+            }
         )
 
     except Exception as e:
