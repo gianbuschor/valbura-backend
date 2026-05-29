@@ -2385,11 +2385,15 @@ async def upsert_bitget_cashflows(
                     fx_rate = await get_fx_rate(conn, coin, base_currency, cashflow_date)
 
                     if fx_rate is None:
-                        amount_base = None
+                        # Fallback: store 1:1 (no conversion) and warn.
+                        # amount_base will be inaccurate until the FX rate is
+                        # backfilled and the record is re-synced.
+                        amount_base = amount_native
                         cashflows_skipped_no_fx += 1
                         print(
                             f"[Bitget cashflow] No FX rate: {coin}→{base_currency} "
-                            f"on {cashflow_date} | {external_id}"
+                            f"on {cashflow_date} — storing amount_native as amount_base "
+                            f"(1:1 fallback) | {external_id}"
                         )
                     else:
                         amount_base = amount_native * fx_rate
