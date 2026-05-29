@@ -2471,6 +2471,199 @@ async def upsert_bitget_cashflows(
     }
 
 
+async def upsert_bitget_funding_fees(
+    conn,
+    portfolio_name: str,
+    portfolio_id,
+    base_currency: str,
+) -> dict:
+    """
+    Import Bitget perpetual-futures funding fees into realized_pnl_events.
+
+    Funding fees are trading P&L, not capital flows — they must NOT go into
+    portfolio_cashflows, which feeds the TWR/performance calculation as external
+    capital adjustments. The NAV snapshot already reflects funding fees in the
+    account balance; storing them in portfolio_cashflows would hide losses from
+    performance and inflate net_profit.
+
+    realized_pnl_events is isolated from the TWR chain and feeds only analytics
+    views (v_closed_positions_public, v_closed_positions_detail_public,
+    v_public_portfolio_summary.closed_pnl).
+
+    Strategy:
+    - Loops in 90-day windows from 2025-08-01 to today
+      (first funding fee observed 2025-08-27; 2025-08-01 gives a safe margin).
+    - Iterates over all three product types: USDT-FUTURES, USDC-FUTURES, COIN-FUTURES.
+    - Uses idLessThan cursor pagination within each window (newest → oldest).
+    - Endpoint: GET /api/v2/mix/account/bill with businessType=contract_settle_fee
+    - coin field is 'USDT' for USDT-FUTURES, 'USDC' for USDC-FUTURES,
+      and the base asset (BTC, ETH …) for COIN-FUTURES.
+    - amount is already signed: negative = paid out, positive = received.
+    - realized_pnl_base = realized_pnl * FX rate (coin → base_currency).
+    - If no FX rate is found: realized_pnl_base = NULL, warning is printed.
+    - UPSERT key: UNIQUE (broker, external_id).
+    """
+    today = datetime.now(timezone.utc).date()
+    # First funding fee observed 2025-08-27; start 2025-08-01 for safety.
+    window_start = date(2025, 8, 1)
+
+    funding_fees_seen = 0
+    funding_fees_inserted = 0
+    funding_fees_updated = 0
+    funding_fees_skipped_no_fx = 0
+
+    product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
+
+    for product_type in product_types:
+        current_start = window_start
+
+        while current_start <= today:
+            current_end = min(current_start + timedelta(days=89), today)
+
+            start_ms = str(int(
+                datetime(
+                    current_start.year,
+                    current_start.month,
+                    current_start.day,
+                    tzinfo=timezone.utc,
+                ).timestamp() * 1000
+            ))
+            end_ms = str(int(
+                datetime(
+                    current_end.year,
+                    current_end.month,
+                    current_end.day,
+                    23, 59, 59,
+                    tzinfo=timezone.utc,
+                ).timestamp() * 1000
+            ))
+
+            id_less_than = None
+
+            while True:
+                params: dict = {
+                    "productType": product_type,
+                    "businessType": "contract_settle_fee",
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                    "limit": "100",
+                }
+                if id_less_than is not None:
+                    params["idLessThan"] = id_less_than
+
+                data = await bitget_get("/api/v2/mix/account/bill", params)
+                records = data.get("data") or []
+                if isinstance(records, dict):
+                    records = records.get("bills") or records.get("list") or []
+
+                # Defensive: skip non-dict entries (malformed API responses)
+                records = [r for r in records if isinstance(r, dict)]
+
+                if not records:
+                    break
+
+                for bill in records:
+                    funding_fees_seen += 1
+
+                    bill_id   = bill.get("billId") or bill.get("id") or ""
+                    symbol    = bill.get("symbol") or ""
+                    coin      = (bill.get("coin") or "USDT").upper()
+                    realized_pnl = parse_decimal(bill.get("amount"), 0)
+
+                    ctime_ms = bill.get("cTime")
+                    try:
+                        event_time = datetime.fromtimestamp(
+                            int(ctime_ms) / 1000, tz=timezone.utc
+                        )
+                    except Exception:
+                        event_time = datetime.now(timezone.utc)
+
+                    event_date  = event_time.date()
+                    external_id = f"Bitget:{portfolio_name}:funding_fee:{bill_id}"
+
+                    # FX conversion: coin → portfolio base currency
+                    fx_rate = await get_fx_rate(conn, coin, base_currency, event_date)
+
+                    if fx_rate is None:
+                        realized_pnl_base = None
+                        funding_fees_skipped_no_fx += 1
+                        print(
+                            f"⚠️ WARNING: No FX rate for {coin}→{base_currency} "
+                            f"on {event_date} — realized_pnl_base set to NULL | {external_id}"
+                        )
+                    else:
+                        realized_pnl_base = realized_pnl * fx_rate
+
+                    # Track insert vs. update for counters
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT id FROM public.realized_pnl_events
+                        WHERE broker      = 'Bitget'
+                          AND external_id = $1
+                        """,
+                        external_id,
+                    )
+
+                    await conn.execute(
+                        """
+                        INSERT INTO public.realized_pnl_events (
+                            portfolio_id, broker, symbol, asset_class,
+                            realized_pnl, currency, realized_pnl_base,
+                            event_time, external_id, raw_payload
+                        )
+                        VALUES (
+                            $1, 'Bitget', $2, 'FundingFee',
+                            $3, $4, $5,
+                            $6, $7, $8::jsonb
+                        )
+                        ON CONFLICT (broker, external_id)
+                        DO UPDATE SET
+                            portfolio_id      = EXCLUDED.portfolio_id,
+                            symbol            = EXCLUDED.symbol,
+                            realized_pnl      = EXCLUDED.realized_pnl,
+                            currency          = EXCLUDED.currency,
+                            realized_pnl_base = EXCLUDED.realized_pnl_base,
+                            event_time        = EXCLUDED.event_time,
+                            raw_payload       = EXCLUDED.raw_payload
+                        """,
+                        portfolio_id,
+                        symbol,
+                        realized_pnl,
+                        coin,
+                        realized_pnl_base,
+                        event_time,
+                        external_id,
+                        json.dumps(bill),
+                    )
+
+                    if existing:
+                        funding_fees_updated += 1
+                    else:
+                        funding_fees_inserted += 1
+
+                # Fewer than 100 records → last page of this window.
+                if len(records) < 100:
+                    break
+
+                # Next page: smallest billId becomes idLessThan cursor.
+                try:
+                    id_less_than = str(
+                        min(int(r.get("billId") or "0") for r in records)
+                    )
+                except Exception:
+                    break
+
+            current_start = current_end + timedelta(days=1)
+
+    return {
+        "portfolio": portfolio_name,
+        "funding_fees_seen": funding_fees_seen,
+        "funding_fees_inserted": funding_fees_inserted,
+        "funding_fees_updated": funding_fees_updated,
+        "funding_fees_skipped_no_fx": funding_fees_skipped_no_fx,
+    }
+
+
 @app.post("/debug/bitget/tpsl")
 async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
     try:
@@ -2542,6 +2735,7 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
         total_updated = 0
         results = []
         cashflow_results = []
+        funding_fee_results = []
 
         product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
 
@@ -2599,6 +2793,15 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
             )
             cashflow_results.append(cashflow_result)
 
+            # A2.2 — import perpetual-futures funding fees
+            funding_fee_result = await upsert_bitget_funding_fees(
+                conn,
+                portfolio_name,
+                portfolio_id,
+                base_currency,
+            )
+            funding_fee_results.append(funding_fee_result)
+
             snapshot_result = await upsert_bitget_snapshot_and_positions(conn, portfolio_name)
 
             await finish_import_job(
@@ -2611,6 +2814,7 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 metadata={
                     "results": results,
                     "cashflows": cashflow_result,
+                    "funding_fees": funding_fee_result,
                     "snapshot": snapshot_result,
                 },
             )
@@ -2628,6 +2832,7 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 "rows_updated": total_updated,
                 "results": results,
                 "cashflows": cashflow_results,
+                "funding_fees": funding_fee_results,
             }
         )
 
