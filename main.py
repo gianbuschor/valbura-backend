@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 import csv
 import io
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta, date
 from decimal import Decimal
 from uuid import UUID
@@ -20,7 +21,30 @@ import asyncpg
 import httpx
 
 
-app = FastAPI(title="Valbura Portfolio API")
+# ---------------------------------------------------------------------
+# Lifespan — on startup, sweep any import_jobs left in status='started'
+# by a previous container that died mid-sync (Railway proxy kills the
+# HTTP connection after ~60s on long syncs; the row never gets marked
+# finished). Implementation in sweep_stale_import_jobs() below.
+# ---------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: "FastAPI"):
+    try:
+        conn = await get_conn()
+        try:
+            swept = await sweep_stale_import_jobs(conn)
+            if swept > 0:
+                print(f"[lifespan] swept {swept} stale import_jobs at startup")
+        finally:
+            await conn.close()
+    except Exception as e:
+        # Never let a sweeper failure block app startup.
+        print(f"[lifespan] startup sweeper failed (ignored): {e}")
+    yield
+    # Shutdown: nothing to do for now.
+
+
+app = FastAPI(title="Valbura Portfolio API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -127,6 +151,35 @@ async def finish_import_job(
         error_message,
         json.dumps(metadata) if metadata is not None else None,
     )
+
+
+async def sweep_stale_import_jobs(conn) -> int:
+    """Mark any import_jobs row stuck in status='started' for >15 min as 'failed'.
+
+    Safety net for sync runs whose owning HTTP connection / container died
+    before finish_import_job could be called (Railway proxy 60s timeout,
+    deploy mid-sync, OOM kill, etc.). 15 minutes is roughly 4x the longest
+    legitimate run today (IBKR ~3.5 min) — wide enough not to kill a real
+    sync, tight enough to surface drift fast.
+
+    Returns the number of rows transitioned. Idempotent: re-running it
+    immediately is a no-op.
+    """
+    result = await conn.execute(
+        """
+        UPDATE public.import_jobs
+        SET status = 'failed',
+            finished_at = now(),
+            error_message = 'auto-stale: status started > 15 min, presumed crashed'
+        WHERE status = 'started'
+          AND started_at < now() - interval '15 minutes'
+        """
+    )
+    # asyncpg returns a tag like "UPDATE 3"; parse the count defensively.
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return 0
 
 
 async def log_sync_error(conn, broker: str, portfolio_name: Optional[str], error_message: str, raw_payload: Optional[dict] = None):
@@ -1650,6 +1703,48 @@ async def run_ibkr_sync_job():
             "error": str(e),
         }
 
+    finally:
+        await conn.close()
+
+
+@app.get("/sync/status/{job_id}")
+async def get_sync_job_status(job_id: str, x_admin_token: Optional[str] = Header(None)):
+    """Return the full import_jobs row for a given job_id.
+
+    Admin-token protected, like the POST /sync/* endpoints — the response
+    can carry error messages and broker metadata that don't belong in a
+    public surface. The public dashboard continues to use
+    /public/sync-status (the v_sync_status view).
+    """
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    try:
+        job_uuid = UUID(job_id)
+    except ValueError:
+        return JSONResponse(
+            content={"error": "Invalid job_id (must be a UUID)"},
+            status_code=400,
+        )
+
+    conn = await get_conn()
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT id, broker, portfolio_name, source_account, status,
+                   started_at, finished_at,
+                   rows_seen, rows_inserted, rows_updated,
+                   error_message, metadata
+            FROM public.import_jobs
+            WHERE id = $1
+            """,
+            job_uuid,
+        )
+        if row is None:
+            return JSONResponse(content={"error": "job not found"}, status_code=404)
+        return JSONResponse(content=json_safe(dict(row)))
     finally:
         await conn.close()
 
