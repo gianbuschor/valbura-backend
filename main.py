@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Header, BackgroundTasks
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -154,8 +154,8 @@ async def finish_import_job(
 
 
 # How long an import_jobs row may stay in status='started' before it is treated
-# as crashed. This ONE constant is shared by BOTH the startup sweeper and the
-# /sync/bitget row-based concurrency check — they MUST use the same value, or a
+# as crashed. This ONE constant is shared by the startup sweeper AND the
+# /sync/{bitget,ibkr} row-based concurrency checks — they MUST use the same value, or a
 # healthy-but-still-running sync could be (a) wrongly swept to 'failed' and
 # (b) treated as "not running" by the lock check, allowing a duplicate run.
 #
@@ -1661,75 +1661,79 @@ async def upsert_ibkr_realized_pnl(conn, portfolio_name: str, xml_text: str):
     }
 
 
-async def run_ibkr_sync_job():
+IBKR_LOCK_KEY = "sync:ibkr"  # advisory-lock key, distinct from Bitget so the two
+                            # brokers never serialize against each other.
+_ibkr_tasks: set = set()    # strong refs to in-flight IBKR workers (asyncio only
+                            # holds weak refs to tasks -> keep our own or it may GC).
+
+
+async def run_ibkr_sync_job(jobs: list):
+    """Background worker for /sync/ibkr. Mirrors run_bitget_sync_job.
+
+    Opens and OWNS its own connection. The import_jobs rows were already created
+    (status='started') and COMMITTED by the request handler inside its xact lock;
+    this worker only receives their ids + portfolio names + Flex query ids and
+    drives the actual import, finishing each job independently.
+
+    No advisory lock is held here. Concurrency is gated entirely in the handler
+    (transaction-scoped lock + a row-based "is one already running?" check) — the
+    only approach that survives the Supavisor transaction pooler.
+
+    Contract:
+      * Each portfolio runs in its OWN try/except — one failing does NOT abort
+        the other.
+      * The `finally` block ALWAYS closes the connection. On a hard crash the
+        jobs stay 'started' and are reclaimed by the sweeper once they exceed
+        STALE_JOB_MINUTES.
+    """
     conn = await get_conn()
-    job_id = None
-    total_seen = 0
-    total_inserted = 0
-    total_updated = 0
-    results = []
-
     try:
-        global_query = os.getenv("IBKR_ACTIVITY_QUERY_ID_GLOBAL")
-        alternatives_query = os.getenv("IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES") or global_query
+        for job in jobs:
+            portfolio_name = job["portfolio"]
+            job_id = job["job_id"]
+            query_id = job["query_id"]
+            try:
+                # Stamp the moment THIS worker actually starts this portfolio, so
+                # the sweeper/lock-check measure each job's age from its OWN work
+                # (see the STALE_JOB_MINUTES comment). started_at stays intact as
+                # the acceptance time.
+                await conn.execute(
+                    """
+                    UPDATE public.import_jobs
+                    SET metadata = COALESCE(metadata, '{}'::jsonb)
+                                   || jsonb_build_object('work_started_at', now())
+                    WHERE id = $1
+                    """,
+                    job_id,
+                )
 
-        if not global_query:
-            raise RuntimeError("IBKR_ACTIVITY_QUERY_ID_GLOBAL missing")
+                xml_text = await fetch_ibkr_flex_report(query_id)
+                result = await upsert_ibkr_trades(conn, portfolio_name, xml_text)
+                snapshot_result = await upsert_ibkr_snapshot_and_positions(conn, portfolio_name, xml_text)
+                realized_result = await upsert_ibkr_realized_pnl(conn, portfolio_name, xml_text)
 
-        for portfolio_name, query_id in [
-            ("Global", global_query),
-            ("Alternatives", alternatives_query),
-        ]:
-            job_id = await start_import_job(
-                conn,
-                "IBKR",
-                portfolio_name,
-                {"query_id": query_id},
-            )
+                result["snapshot"] = snapshot_result
+                result["realized_pnl"] = realized_result
 
-            xml_text = await fetch_ibkr_flex_report(query_id)
-            result = await upsert_ibkr_trades(conn, portfolio_name, xml_text)
-            snapshot_result = await upsert_ibkr_snapshot_and_positions(conn, portfolio_name, xml_text)
-            realized_result = await upsert_ibkr_realized_pnl(conn, portfolio_name, xml_text)
-            
-            result["snapshot"] = snapshot_result
-            result["realized_pnl"] = realized_result
-
-            await finish_import_job(
-                conn,
-                job_id,
-                "success",
-                rows_seen=result["rows_seen"],
-                rows_inserted=result["rows_inserted"],
-                rows_updated=result["rows_updated"],
-                metadata=result,
-            )
-            
-            total_seen += result["rows_seen"]
-            total_inserted += result["rows_inserted"]
-            total_updated += result["rows_updated"]
-            results.append(result)
-
-        return {
-            "status": "success",
-            "broker": "IBKR",
-            "rows_seen": total_seen,
-            "rows_inserted": total_inserted,
-            "rows_updated": total_updated,
-            "results": results,
-        }
-
-    except Exception as e:
-        if job_id:
-            await finish_import_job(conn, job_id, "failed", error_message=str(e))
-        await log_sync_error(conn, "IBKR", None, str(e))
-        return {
-            "status": "failed",
-            "broker": "IBKR",
-            "error": str(e),
-        }
-
+                await finish_import_job(
+                    conn,
+                    job_id,
+                    "success",
+                    rows_seen=result["rows_seen"],
+                    rows_inserted=result["rows_inserted"],
+                    rows_updated=result["rows_updated"],
+                    metadata=result,
+                )
+            except Exception as e:
+                # Isolate the failure to THIS portfolio; the loop continues.
+                print(f"[ibkr] portfolio {portfolio_name} failed: {e}")
+                try:
+                    await finish_import_job(conn, job_id, "failed", error_message=str(e))
+                    await log_sync_error(conn, "IBKR", portfolio_name, str(e))
+                except Exception as inner:
+                    print(f"[ibkr] could not record failure for {portfolio_name}: {inner}")
     finally:
+        # ALWAYS close the worker's own connection.
         await conn.close()
 
 
@@ -1777,32 +1781,116 @@ async def get_sync_job_status(job_id: str, x_admin_token: Optional[str] = Header
 
 @app.post("/sync/ibkr")
 async def sync_ibkr(x_admin_token: Optional[str] = Header(None)):
-    try:
-        require_admin_token(x_admin_token)
-    except PermissionError:
-        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
-
-    result = await run_ibkr_sync_job()
-
-    status_code = 200 if result.get("status") == "success" else 500
-    return JSONResponse(content=result, status_code=status_code)
+    return await _start_ibkr_sync(x_admin_token)
 
 
 @app.post("/sync/ibkr/trigger")
-async def trigger_ibkr(background_tasks: BackgroundTasks, x_admin_token: Optional[str] = Header(None)):
+async def trigger_ibkr(x_admin_token: Optional[str] = Header(None)):
+    # Alias of /sync/ibkr, kept through go-live so a cron pointing at EITHER
+    # route keeps working. Remove after the cron target is confirmed/migrated.
+    return await _start_ibkr_sync(x_admin_token)
+
+
+async def _start_ibkr_sync(x_admin_token: Optional[str]):
+    """Async /sync/ibkr handler, mirroring sync_bitget.
+
+    Returns 202 + job ids after creating both portfolio jobs inside a pooler-safe
+    transaction-scoped advisory lock; 409 if an IBKR sync is already running; 401
+    on a bad token; 500 on a setup/DB error.
+    """
     try:
         require_admin_token(x_admin_token)
     except PermissionError:
         return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
 
-    background_tasks.add_task(run_ibkr_sync_job)
+    global_query = os.getenv("IBKR_ACTIVITY_QUERY_ID_GLOBAL")
+    alternatives_query = os.getenv("IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES") or global_query
+    if not global_query:
+        return JSONResponse(
+            content={"status": "failed", "broker": "IBKR",
+                     "error": "IBKR_ACTIVITY_QUERY_ID_GLOBAL missing"},
+            status_code=500,
+        )
+    portfolios = [("Global", global_query), ("Alternatives", alternatives_query)]
+
+    jobs = []
+    already_running = False
+
+    conn = await get_conn()
+    try:
+        # (4) Sweep stale zombies first — never let a sweep failure block the sync.
+        try:
+            swept = await sweep_stale_import_jobs(conn)
+            if swept > 0:
+                print(f"[ibkr] swept {swept} stale import_jobs before sync")
+        except Exception as e:
+            print(f"[ibkr] pre-sync sweep failed (ignored): {e}")
+
+        # (2) Pooler-safe mutex (see sync_bitget for the full rationale). A
+        #     TRANSACTION-scoped advisory lock serializes the check+insert (one
+        #     transaction = one pinned backend), and the mutex STATE is row-based.
+        #     Distinct lock key from Bitget so the two brokers don't block each
+        #     other; the row check is scoped to broker='IBKR'. Check AND insert run
+        #     in the SAME transaction under the SAME lock -> no TOCTOU window. The
+        #     xact lock auto-releases at COMMIT.
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))", IBKR_LOCK_KEY
+            )
+            running = await conn.fetchval(
+                f"""
+                SELECT count(*) FROM public.import_jobs
+                WHERE broker = 'IBKR'
+                  AND status = 'started'
+                  AND COALESCE((metadata->>'work_started_at')::timestamptz, started_at)
+                        > now() - interval '{STALE_JOB_MINUTES} minutes'
+                """
+            )
+            if running and running > 0:
+                already_running = True
+            else:
+                # Create both jobs INSIDE the locked transaction so their ids ride
+                # along in the 202 and a concurrent caller sees them.
+                for portfolio_name, query_id in portfolios:
+                    job_id = await start_import_job(
+                        conn,
+                        "IBKR",
+                        portfolio_name,
+                        {"query_id": query_id},
+                    )
+                    jobs.append({
+                        "job_id": job_id,                   # UUID, used by the worker
+                        "broker": "IBKR",
+                        "portfolio": portfolio_name,
+                        "query_id": query_id,               # passed to the worker
+                        "poll_url": f"/sync/status/{job_id}",
+                    })
+        # transaction committed: jobs are persisted and the xact lock is released.
+    except Exception as e:
+        await conn.close()
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+    finally:
+        if not conn.is_closed():
+            await conn.close()
+
+    if already_running:
+        return JSONResponse(
+            content={
+                "status": "in_progress",
+                "broker": "IBKR",
+                "message": "an IBKR sync is already running",
+            },
+            status_code=409,
+        )
+
+    # Spawn the worker, which opens and owns its OWN fresh connection. Keep a
+    # strong reference so the task can't be GC'd mid-run.
+    task = asyncio.create_task(run_ibkr_sync_job(jobs))
+    _ibkr_tasks.add(task)
+    task.add_done_callback(_ibkr_tasks.discard)
 
     return JSONResponse(
-        content={
-            "status": "accepted",
-            "broker": "IBKR",
-            "message": "IBKR sync started in background",
-        },
+        content=json_safe({"status": "accepted", "broker": "IBKR", "jobs": jobs}),
         status_code=202,
     )
 
