@@ -2815,26 +2815,156 @@ async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
     }))
 
 
+BITGET_LOCK_KEY = "sync:bitget"  # advisory-lock key, shared by handler + worker
+
+
+async def run_bitget_sync_job(conn, jobs: list):
+    """Background worker for /sync/bitget.
+
+    Takes sole ownership of `conn` for its entire lifetime. By the time this
+    runs, `conn` ALREADY holds the 'sync:bitget' advisory lock and the two
+    import_jobs rows were already INSERTed on it by the request handler.
+
+    Contract:
+      * Each portfolio runs in its own try/except — one failing does NOT
+        abort the other.
+      * The `finally` block ALWAYS releases the advisory lock and closes the
+        connection, even on crash. (If the container dies first, the lock
+        auto-releases when Postgres notices the dead session, and the startup
+        sweeper flips the still-'started' jobs to 'failed' after 15 min.)
+    """
+    try:
+        product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
+
+        for job in jobs:
+            portfolio_name = job["portfolio"]
+            job_id = job["job_id"]
+            try:
+                # Resolve portfolio_id and base_currency from DB (not hardcoded).
+                portfolio_row = await conn.fetchrow(
+                    "SELECT id, base_currency FROM public.portfolios WHERE name = $1",
+                    portfolio_name,
+                )
+                if not portfolio_row:
+                    raise RuntimeError(f"Portfolio not found: {portfolio_name}")
+                portfolio_id = portfolio_row["id"]
+                base_currency = portfolio_row["base_currency"]
+
+                portfolio_seen = 0
+                portfolio_inserted = 0
+                portfolio_updated = 0
+                results = []  # per-portfolio — no cross-contamination in metadata
+
+                for product_type in product_types:
+                    data = await bitget_get(
+                        "/api/v2/mix/order/fill-history",
+                        {"productType": product_type, "limit": "100"},
+                    )
+
+                    rows = data.get("data") or []
+                    if isinstance(rows, dict):
+                        rows = rows.get("fillList") or rows.get("list") or []
+
+                    result = await upsert_bitget_rows(
+                        conn,
+                        portfolio_name,
+                        rows,
+                        product_type,
+                    )
+
+                    portfolio_seen += result["rows_seen"]
+                    portfolio_inserted += result["rows_inserted"]
+                    portfolio_updated += result["rows_updated"]
+                    results.append(result)
+
+                # A2.1 — import deposits and withdrawals
+                cashflow_result = await upsert_bitget_cashflows(
+                    conn,
+                    portfolio_name,
+                    portfolio_id,
+                    base_currency,
+                )
+
+                # A2.2 — import perpetual-futures funding fees
+                funding_fee_result = await upsert_bitget_funding_fees(
+                    conn,
+                    portfolio_name,
+                    portfolio_id,
+                    base_currency,
+                )
+
+                snapshot_result = await upsert_bitget_snapshot_and_positions(conn, portfolio_name)
+
+                await finish_import_job(
+                    conn,
+                    job_id,
+                    "success",
+                    rows_seen=portfolio_seen,
+                    rows_inserted=portfolio_inserted,
+                    rows_updated=portfolio_updated,
+                    metadata={
+                        "results": results,
+                        "cashflows": cashflow_result,
+                        "funding_fees": funding_fee_result,
+                        "snapshot": snapshot_result,
+                    },
+                )
+            except Exception as e:
+                # Isolate the failure to THIS portfolio; the loop continues.
+                print(f"[bitget] portfolio {portfolio_name} failed: {e}")
+                try:
+                    await finish_import_job(conn, job_id, "failed", error_message=str(e))
+                    await log_sync_error(conn, "Bitget", portfolio_name, str(e))
+                except Exception as inner:
+                    print(f"[bitget] could not record failure for {portfolio_name}: {inner}")
+    finally:
+        # ALWAYS release the lock and close the connection.
+        try:
+            await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", BITGET_LOCK_KEY)
+        except Exception as e:
+            print(f"[bitget] advisory unlock failed (auto-releases on conn close): {e}")
+        finally:
+            await conn.close()
+
+
 @app.post("/sync/bitget")
 async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
     try:
         require_admin_token(x_admin_token)
     except PermissionError:
         return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
     conn = await get_conn()
-    job_id = None
 
+    # (4) Sweep stale zombies first — before taking the lock or creating jobs.
+    #     Never let a sweep failure block the actual sync.
     try:
-        total_seen = 0
-        total_inserted = 0
-        total_updated = 0
-        results = []
-        cashflow_results = []
-        funding_fee_results = []
+        swept = await sweep_stale_import_jobs(conn)
+        if swept > 0:
+            print(f"[bitget] swept {swept} stale import_jobs before sync")
+    except Exception as e:
+        print(f"[bitget] pre-sync sweep failed (ignored): {e}")
 
-        product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
+    # (2) Advisory lock — acquired SYNCHRONOUSLY on this connection. If a Bitget
+    #     sync is already running, bail out with 409 before touching anything.
+    locked = await conn.fetchval(
+        "SELECT pg_try_advisory_lock(hashtext($1))", BITGET_LOCK_KEY
+    )
+    if not locked:
+        await conn.close()
+        return JSONResponse(
+            content={
+                "status": "in_progress",
+                "broker": "Bitget",
+                "message": "a Bitget sync is already running",
+            },
+            status_code=409,
+        )
 
-        # For now, mirror to both portfolios until you have separated Bitget accounts/API keys.
+    # (3) Create both jobs up front so their ids ride along in the 202 response.
+    product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
+    jobs = []
+    try:
         for portfolio_name in ["Global", "Alternatives"]:
             job_id = await start_import_job(
                 conn,
@@ -2842,103 +2972,34 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 portfolio_name,
                 {"product_types": product_types},
             )
-
-            # Resolve portfolio_id and base_currency from DB (not hardcoded).
-            portfolio_row = await conn.fetchrow(
-                "SELECT id, base_currency FROM public.portfolios WHERE name = $1",
-                portfolio_name,
-            )
-            if not portfolio_row:
-                raise RuntimeError(f"Portfolio not found: {portfolio_name}")
-            portfolio_id = portfolio_row["id"]
-            base_currency = portfolio_row["base_currency"]
-
-            portfolio_seen = 0
-            portfolio_inserted = 0
-            portfolio_updated = 0
-
-            for product_type in product_types:
-                data = await bitget_get(
-                    "/api/v2/mix/order/fill-history",
-                    {"productType": product_type, "limit": "100"},
-                )
-
-                rows = data.get("data") or []
-                if isinstance(rows, dict):
-                    rows = rows.get("fillList") or rows.get("list") or []
-
-                result = await upsert_bitget_rows(
-                    conn,
-                    portfolio_name,
-                    rows,
-                    product_type,
-                )
-
-                portfolio_seen += result["rows_seen"]
-                portfolio_inserted += result["rows_inserted"]
-                portfolio_updated += result["rows_updated"]
-                results.append(result)
-
-            # A2.1 — import deposits and withdrawals
-            cashflow_result = await upsert_bitget_cashflows(
-                conn,
-                portfolio_name,
-                portfolio_id,
-                base_currency,
-            )
-            cashflow_results.append(cashflow_result)
-
-            # A2.2 — import perpetual-futures funding fees
-            funding_fee_result = await upsert_bitget_funding_fees(
-                conn,
-                portfolio_name,
-                portfolio_id,
-                base_currency,
-            )
-            funding_fee_results.append(funding_fee_result)
-
-            snapshot_result = await upsert_bitget_snapshot_and_positions(conn, portfolio_name)
-
-            await finish_import_job(
-                conn,
-                job_id,
-                "success",
-                rows_seen=portfolio_seen,
-                rows_inserted=portfolio_inserted,
-                rows_updated=portfolio_updated,
-                metadata={
-                    "results": results,
-                    "cashflows": cashflow_result,
-                    "funding_fees": funding_fee_result,
-                    "snapshot": snapshot_result,
-                },
-            )
-
-            total_seen += portfolio_seen
-            total_inserted += portfolio_inserted
-            total_updated += portfolio_updated
-
-        return JSONResponse(
-            content={
-                "status": "success",
+            jobs.append({
+                "job_id": job_id,                       # UUID, used by the worker
                 "broker": "Bitget",
-                "rows_seen": total_seen,
-                "rows_inserted": total_inserted,
-                "rows_updated": total_updated,
-                "results": results,
-                "cashflows": cashflow_results,
-                "funding_fees": funding_fee_results,
-            }
-        )
-
+                "portfolio": portfolio_name,
+                "poll_url": f"/sync/status/{job_id}",
+            })
     except Exception as e:
-        if job_id:
-            await finish_import_job(conn, job_id, "failed", error_message=str(e))
-        await log_sync_error(conn, "Bitget", None, str(e))
+        # Job creation failed — unwind cleanly: fail any created jobs,
+        # release the lock, close the connection. Nothing is handed off.
+        for j in jobs:
+            try:
+                await finish_import_job(conn, j["job_id"], "failed", error_message=str(e))
+            except Exception:
+                pass
+        try:
+            await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", BITGET_LOCK_KEY)
+        finally:
+            await conn.close()
         return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
 
-    finally:
-        await conn.close()
+    # (1) Hand the connection (lock + jobs) to the background worker. From here
+    #     on, the worker owns `conn` — the handler must not touch it again.
+    asyncio.create_task(run_bitget_sync_job(conn, jobs))
+
+    return JSONResponse(
+        content=json_safe({"status": "accepted", "broker": "Bitget", "jobs": jobs}),
+        status_code=202,
+    )
 
 @app.post("/sync/fx")
 async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
