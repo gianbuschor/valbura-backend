@@ -159,12 +159,23 @@ async def finish_import_job(
 # healthy-but-still-running sync could be (a) wrongly swept to 'failed' and
 # (b) treated as "not running" by the lock check, allowing a duplicate run.
 #
-# Why 40 (not 15): a single healthy Bitget funding-fee FULL-history scan already
-# takes ~13-14 min today and grows with history. The sweeper must NEVER kill a
-# running healthy sync, so the threshold has to sit safely above the realistic
-# maximum run time — 40 min gives months of headroom. Lower this back toward a
-# few minutes once the funding-fee import is incremental (only new bills since
-# the last successful sync) instead of a full rescan.
+# Both the sweeper and the lock-check measure a job's age from
+# COALESCE((metadata->>'work_started_at')::timestamptz, started_at), NOT from
+# started_at alone. Reason: /sync/bitget creates BOTH portfolio jobs up front
+# sharing one started_at, but the worker processes them SEQUENTIALLY (Global,
+# then Alternatives). Measured purely from started_at the second job is ~2x its
+# real age at completion (~54 min vs ~27 min of actual work) and would trip this
+# threshold mid-run. The worker stamps metadata.work_started_at = now() the
+# moment it actually picks up each portfolio, so each job's age reflects its OWN
+# work. started_at is left intact as the acceptance time (no created_at column
+# exists, so we must not overwrite it).
+#
+# Why 40 (not 15): a single healthy Bitget funding-fee FULL-history scan takes
+# ~27 min today (measured) and grows with history. With work_started_at the
+# sweeper/lock-check see ~27 min, so 40 leaves real headroom without killing a
+# healthy run. This is a BRIDGE: lower it back toward a few minutes once the
+# funding-fee import is incremental (only new bills since the last successful
+# sync) instead of a full rescan, which collapses runtime to seconds.
 STALE_JOB_MINUTES = 40
 
 
@@ -186,7 +197,8 @@ async def sweep_stale_import_jobs(conn) -> int:
             finished_at = now(),
             error_message = 'auto-stale: status started > {STALE_JOB_MINUTES} min, presumed crashed'
         WHERE status = 'started'
-          AND started_at < now() - interval '{STALE_JOB_MINUTES} minutes'
+          AND COALESCE((metadata->>'work_started_at')::timestamptz, started_at)
+                < now() - interval '{STALE_JOB_MINUTES} minutes'
         """
     )
     # asyncpg returns a tag like "UPDATE 3"; parse the count defensively.
@@ -2866,6 +2878,24 @@ async def run_bitget_sync_job(jobs: list):
             portfolio_name = job["portfolio"]
             job_id = job["job_id"]
             try:
+                # Stamp the moment THIS worker actually starts this portfolio.
+                # Both jobs were created up front sharing one started_at, but are
+                # processed sequentially, so started_at would overstate the second
+                # job's age. The sweeper + lock-check read
+                # COALESCE(work_started_at, started_at), so this keeps each job's
+                # measured age tied to its OWN work. started_at stays as the
+                # acceptance time. finish_import_job later replaces metadata, but
+                # by then status != 'started' so neither check looks at this row.
+                await conn.execute(
+                    """
+                    UPDATE public.import_jobs
+                    SET metadata = COALESCE(metadata, '{}'::jsonb)
+                                   || jsonb_build_object('work_started_at', now())
+                    WHERE id = $1
+                    """,
+                    job_id,
+                )
+
                 # Resolve portfolio_id and base_currency from DB (not hardcoded).
                 portfolio_row = await conn.fetchrow(
                     "SELECT id, base_currency FROM public.portfolios WHERE name = $1",
@@ -2993,7 +3023,8 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
                 SELECT count(*) FROM public.import_jobs
                 WHERE broker = 'Bitget'
                   AND status = 'started'
-                  AND started_at > now() - interval '{STALE_JOB_MINUTES} minutes'
+                  AND COALESCE((metadata->>'work_started_at')::timestamptz, started_at)
+                        > now() - interval '{STALE_JOB_MINUTES} minutes'
                 """
             )
             if running and running > 0:
