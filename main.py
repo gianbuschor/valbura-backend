@@ -153,26 +153,40 @@ async def finish_import_job(
     )
 
 
+# How long an import_jobs row may stay in status='started' before it is treated
+# as crashed. This ONE constant is shared by BOTH the startup sweeper and the
+# /sync/bitget row-based concurrency check — they MUST use the same value, or a
+# healthy-but-still-running sync could be (a) wrongly swept to 'failed' and
+# (b) treated as "not running" by the lock check, allowing a duplicate run.
+#
+# Why 40 (not 15): a single healthy Bitget funding-fee FULL-history scan already
+# takes ~13-14 min today and grows with history. The sweeper must NEVER kill a
+# running healthy sync, so the threshold has to sit safely above the realistic
+# maximum run time — 40 min gives months of headroom. Lower this back toward a
+# few minutes once the funding-fee import is incremental (only new bills since
+# the last successful sync) instead of a full rescan.
+STALE_JOB_MINUTES = 40
+
+
 async def sweep_stale_import_jobs(conn) -> int:
-    """Mark any import_jobs row stuck in status='started' for >15 min as 'failed'.
+    """Mark any import_jobs row stuck in status='started' too long as 'failed'.
 
     Safety net for sync runs whose owning HTTP connection / container died
     before finish_import_job could be called (Railway proxy 60s timeout,
-    deploy mid-sync, OOM kill, etc.). 15 minutes is roughly 4x the longest
-    legitimate run today (IBKR ~3.5 min) — wide enough not to kill a real
-    sync, tight enough to surface drift fast.
+    deploy mid-sync, OOM kill, etc.). The threshold (STALE_JOB_MINUTES) is set
+    safely above the longest legitimate run so a healthy sync is never killed.
 
     Returns the number of rows transitioned. Idempotent: re-running it
     immediately is a no-op.
     """
     result = await conn.execute(
-        """
+        f"""
         UPDATE public.import_jobs
         SET status = 'failed',
             finished_at = now(),
-            error_message = 'auto-stale: status started > 15 min, presumed crashed'
+            error_message = 'auto-stale: status started > {STALE_JOB_MINUTES} min, presumed crashed'
         WHERE status = 'started'
-          AND started_at < now() - interval '15 minutes'
+          AND started_at < now() - interval '{STALE_JOB_MINUTES} minutes'
         """
     )
     # asyncpg returns a tag like "UPDATE 3"; parse the count defensively.
@@ -2817,22 +2831,34 @@ async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
 
 BITGET_LOCK_KEY = "sync:bitget"  # advisory-lock key, shared by handler + worker
 
+# asyncio only keeps weak references to tasks, so a fire-and-forget task can be
+# garbage-collected mid-run. Hold a strong reference until it finishes.
+_bitget_tasks: set = set()
 
-async def run_bitget_sync_job(conn, jobs: list):
+
+async def run_bitget_sync_job(jobs: list):
     """Background worker for /sync/bitget.
 
-    Takes sole ownership of `conn` for its entire lifetime. By the time this
-    runs, `conn` ALREADY holds the 'sync:bitget' advisory lock and the two
-    import_jobs rows were already INSERTed on it by the request handler.
+    Opens and OWNS its own fresh connection for its entire lifetime. The two
+    import_jobs rows were already created (status='started') and COMMITTED by
+    the request handler; this worker only receives their ids + portfolio names
+    and drives the actual import, finishing each job independently.
+
+    No advisory lock is held here. Concurrency is gated entirely in the handler
+    by a transaction-scoped lock + a row-based "is one already running?" check —
+    the only approach that survives the Supavisor transaction pooler (a
+    session-scoped pg_advisory_lock does not, because each autocommit statement
+    can land on a different pooled backend).
 
     Contract:
       * Each portfolio runs in its own try/except — one failing does NOT
         abort the other.
-      * The `finally` block ALWAYS releases the advisory lock and closes the
-        connection, even on crash. (If the container dies first, the lock
-        auto-releases when Postgres notices the dead session, and the startup
-        sweeper flips the still-'started' jobs to 'failed' after 15 min.)
+      * The `finally` block ALWAYS closes the connection. On a hard crash the
+        jobs stay 'started' and are reclaimed by the startup sweeper once they
+        exceed STALE_JOB_MINUTES (and the handler's row check stops treating
+        them as live past the same threshold).
     """
+    conn = await get_conn()
     try:
         product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
 
@@ -2918,13 +2944,8 @@ async def run_bitget_sync_job(conn, jobs: list):
                 except Exception as inner:
                     print(f"[bitget] could not record failure for {portfolio_name}: {inner}")
     finally:
-        # ALWAYS release the lock and close the connection.
-        try:
-            await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", BITGET_LOCK_KEY)
-        except Exception as e:
-            print(f"[bitget] advisory unlock failed (auto-releases on conn close): {e}")
-        finally:
-            await conn.close()
+        # ALWAYS close the worker's own connection.
+        await conn.close()
 
 
 @app.post("/sync/bitget")
@@ -2934,24 +2955,76 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
     except PermissionError:
         return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
 
+    product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
+    jobs = []
+    already_running = False
+
     conn = await get_conn()
-
-    # (4) Sweep stale zombies first — before taking the lock or creating jobs.
-    #     Never let a sweep failure block the actual sync.
     try:
-        swept = await sweep_stale_import_jobs(conn)
-        if swept > 0:
-            print(f"[bitget] swept {swept} stale import_jobs before sync")
-    except Exception as e:
-        print(f"[bitget] pre-sync sweep failed (ignored): {e}")
+        # (4) Sweep stale zombies first — never let a sweep failure block the sync.
+        try:
+            swept = await sweep_stale_import_jobs(conn)
+            if swept > 0:
+                print(f"[bitget] swept {swept} stale import_jobs before sync")
+        except Exception as e:
+            print(f"[bitget] pre-sync sweep failed (ignored): {e}")
 
-    # (2) Advisory lock — acquired SYNCHRONOUSLY on this connection. If a Bitget
-    #     sync is already running, bail out with 409 before touching anything.
-    locked = await conn.fetchval(
-        "SELECT pg_try_advisory_lock(hashtext($1))", BITGET_LOCK_KEY
-    )
-    if not locked:
+        # (2) Pooler-safe mutex. Supabase routes us through Supavisor in
+        #     transaction-pooling mode, so a SESSION-scoped pg_advisory_lock does
+        #     NOT provide mutual exclusion (each autocommit statement may land on
+        #     a different backend). Instead:
+        #       * a TRANSACTION-scoped advisory lock serializes the check+insert
+        #         (one transaction = one pinned backend), and
+        #       * the mutex STATE is row-based: "is there a Bitget job already in
+        #         status='started' younger than the sweeper threshold?".
+        #     Check AND insert happen in the SAME transaction under the SAME lock,
+        #     so there is no TOCTOU window. The xact lock auto-releases at COMMIT.
+        #
+        #     NOTE: STALE_JOB_MINUTES must exceed a healthy run's duration, and it
+        #     is deliberately the SAME constant the sweeper uses (see its comment).
+        #     If the two ever diverged, a still-running healthy sync could be both
+        #     swept to 'failed' and treated as "not running" here -> duplicate run.
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))", BITGET_LOCK_KEY
+            )
+            running = await conn.fetchval(
+                f"""
+                SELECT count(*) FROM public.import_jobs
+                WHERE broker = 'Bitget'
+                  AND status = 'started'
+                  AND started_at > now() - interval '{STALE_JOB_MINUTES} minutes'
+                """
+            )
+            if running and running > 0:
+                already_running = True
+            else:
+                # (3) Create both jobs INSIDE the locked transaction so their ids
+                #     ride along in the 202 and a concurrent caller sees them.
+                for portfolio_name in ["Global", "Alternatives"]:
+                    job_id = await start_import_job(
+                        conn,
+                        "Bitget",
+                        portfolio_name,
+                        {"product_types": product_types},
+                    )
+                    jobs.append({
+                        "job_id": job_id,                   # UUID, used by the worker
+                        "broker": "Bitget",
+                        "portfolio": portfolio_name,
+                        "poll_url": f"/sync/status/{job_id}",
+                    })
+        # transaction committed: jobs are persisted and the xact lock is released.
+    except Exception as e:
+        # Any failure here rolled the transaction back (no half-created jobs) and
+        # released the lock; just report it.
         await conn.close()
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+    finally:
+        if not conn.is_closed():
+            await conn.close()
+
+    if already_running:
         return JSONResponse(
             content={
                 "status": "in_progress",
@@ -2961,40 +3034,11 @@ async def sync_bitget(x_admin_token: Optional[str] = Header(None)):
             status_code=409,
         )
 
-    # (3) Create both jobs up front so their ids ride along in the 202 response.
-    product_types = ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]
-    jobs = []
-    try:
-        for portfolio_name in ["Global", "Alternatives"]:
-            job_id = await start_import_job(
-                conn,
-                "Bitget",
-                portfolio_name,
-                {"product_types": product_types},
-            )
-            jobs.append({
-                "job_id": job_id,                       # UUID, used by the worker
-                "broker": "Bitget",
-                "portfolio": portfolio_name,
-                "poll_url": f"/sync/status/{job_id}",
-            })
-    except Exception as e:
-        # Job creation failed — unwind cleanly: fail any created jobs,
-        # release the lock, close the connection. Nothing is handed off.
-        for j in jobs:
-            try:
-                await finish_import_job(conn, j["job_id"], "failed", error_message=str(e))
-            except Exception:
-                pass
-        try:
-            await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", BITGET_LOCK_KEY)
-        finally:
-            await conn.close()
-        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
-
-    # (1) Hand the connection (lock + jobs) to the background worker. From here
-    #     on, the worker owns `conn` — the handler must not touch it again.
-    asyncio.create_task(run_bitget_sync_job(conn, jobs))
+    # (1) Spawn the worker, which opens and owns its OWN fresh connection — no
+    #     handoff. Keep a strong reference so the task can't be GC'd mid-run.
+    task = asyncio.create_task(run_bitget_sync_job(jobs))
+    _bitget_tasks.add(task)
+    task.add_done_callback(_bitget_tasks.discard)
 
     return JSONResponse(
         content=json_safe({"status": "accepted", "broker": "Bitget", "jobs": jobs}),
