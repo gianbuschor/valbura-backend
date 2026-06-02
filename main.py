@@ -1912,13 +1912,58 @@ def bitget_sign(timestamp: str, method: str, request_path: str, query_string: st
     return base64.b64encode(signature).decode()
 
 
-async def bitget_get(path: str, params: dict):
-    api_key = os.getenv("BITGET_GLOBAL_API_KEY")
-    secret = os.getenv("BITGET_GLOBAL_SECRET")
-    passphrase = os.getenv("BITGET_GLOBAL_PASSPHRASE")
+def get_bitget_creds(portfolio_name: str) -> dict:
+    """Resolve the Bitget API credential set for a given portfolio.
+
+        Global       -> BITGET_GLOBAL_API_KEY / _SECRET / _PASSPHRASE
+        Alternatives -> BITGET_ALTERNATIVES_API_KEY / _SECRET / _PASSPHRASE
+
+    NO silent fallback: if the requested set is missing or incomplete this raises
+    a hard, explicit error. We deliberately do NOT fall back to the Global keys
+    for Alternatives — a missing Alternatives set must fail loudly, never silently
+    mirror the Global account into the Alternatives portfolio.
+
+    The returned dict carries a human-readable 'source' name (GLOBAL/ALTERNATIVES)
+    that is SAFE to log into job metadata. It is never a secret. The actual
+    key/secret/passphrase values are never logged or surfaced anywhere.
+    """
+    prefixes = {
+        "Global": "BITGET_GLOBAL_",
+        "Alternatives": "BITGET_ALTERNATIVES_",
+    }
+    prefix = prefixes.get(portfolio_name)
+    if prefix is None:
+        raise RuntimeError(
+            f"No Bitget credential mapping for portfolio: {portfolio_name!r}"
+        )
+
+    api_key = os.getenv(prefix + "API_KEY")
+    secret = os.getenv(prefix + "SECRET")
+    passphrase = os.getenv(prefix + "PASSPHRASE")
 
     if not api_key or not secret or not passphrase:
-        raise RuntimeError("Bitget API credentials missing")
+        # Name only the expected ENV var NAMES — never echo the (partial) values.
+        raise RuntimeError(
+            f"Bitget credentials missing for portfolio {portfolio_name!r} "
+            f"(expected {prefix}API_KEY / {prefix}SECRET / {prefix}PASSPHRASE)"
+        )
+
+    source = "ALTERNATIVES" if portfolio_name == "Alternatives" else "GLOBAL"
+    return {
+        "api_key": api_key,
+        "secret": secret,
+        "passphrase": passphrase,
+        "source": source,
+    }
+
+
+async def bitget_get(path: str, params: dict, creds: dict):
+    # creds is a required parameter (no default): every call site must pass an
+    # explicitly resolved credential set from get_bitget_creds(). This makes any
+    # missed call site fail fast instead of silently signing with the wrong keys.
+    api_key = creds["api_key"]
+    secret = creds["secret"]
+    passphrase = creds["passphrase"]
 
     query_string = "&".join([f"{k}={v}" for k, v in params.items() if v is not None])
     timestamp = str(int(time.time() * 1000))
@@ -1941,7 +1986,7 @@ async def bitget_get(path: str, params: dict):
             raise RuntimeError(f"Bitget API error: {data}")
         return data
 
-async def fetch_bitget_tpsl_map(product_type: str):
+async def fetch_bitget_tpsl_map(product_type: str, creds: dict):
     """
     Returns:
     {
@@ -1964,6 +2009,7 @@ async def fetch_bitget_tpsl_map(product_type: str):
                 "productType": product_type,
                 "planType": "profit_loss",
             },
+            creds,
         )
     except Exception as e:
         print(f"Bitget TP/SL fetch failed for {product_type}: {e}")
@@ -2067,13 +2113,15 @@ async def debug_bitget_account(x_admin_token: Optional[str] = Header(None)):
         return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
 
     results = {}
+    creds = get_bitget_creds("Global")
 
     try:
         for product_type in ["USDT-FUTURES", "USDC-FUTURES", "COIN-FUTURES"]:
             try:
                 account_data = await bitget_get(
                     "/api/v2/mix/account/accounts",
-                    {"productType": product_type}
+                    {"productType": product_type},
+                    creds,
                 )
 
                 positions_data = await bitget_get(
@@ -2081,7 +2129,8 @@ async def debug_bitget_account(x_admin_token: Optional[str] = Header(None)):
                     {
                         "productType": product_type,
                         "marginCoin": "USDT" if product_type == "USDT-FUTURES" else None,
-                    }
+                    },
+                    creds,
                 )
 
                 results[product_type] = {
@@ -2212,7 +2261,7 @@ async def upsert_bitget_rows(conn, portfolio_name: str, rows: list, product_type
         "rows_updated": rows_updated,
     }
 
-async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
+async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str, creds: dict):
     portfolio_id = await get_portfolio_id(conn, portfolio_name)
 
     product_type = "USDT-FUTURES"
@@ -2221,6 +2270,7 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
     account_data = await bitget_get(
         "/api/v2/mix/account/accounts",
         {"productType": product_type},
+        creds,
     )
 
     positions_data = await bitget_get(
@@ -2229,11 +2279,12 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str):
             "productType": product_type,
             "marginCoin": margin_coin,
         },
+        creds,
     )
 
     # TP/SL orders are not always attached directly to the position.
     # Bitget exposes active TP/SL through plan orders with planType=profit_loss.
-    tpsl_map = await fetch_bitget_tpsl_map(product_type)
+    tpsl_map = await fetch_bitget_tpsl_map(product_type, creds)
 
     accounts = account_data.get("data") or []
     if isinstance(accounts, dict):
@@ -2478,6 +2529,7 @@ async def upsert_bitget_cashflows(
     portfolio_name: str,
     portfolio_id,
     base_currency: str,
+    creds: dict,
 ) -> dict:
     """
     Import Bitget deposits and withdrawals into portfolio_cashflows.
@@ -2547,7 +2599,7 @@ async def upsert_bitget_cashflows(
                 if id_less_than is not None:
                     params["idLessThan"] = id_less_than
 
-                data = await bitget_get(api_path, params)
+                data = await bitget_get(api_path, params, creds)
                 records = data.get("data") or []
                 if isinstance(records, dict):
                     records = (
@@ -2685,6 +2737,7 @@ async def upsert_bitget_funding_fees(
     portfolio_name: str,
     portfolio_id,
     base_currency: str,
+    creds: dict,
 ) -> dict:
     """
     Import Bitget perpetual-futures funding fees into realized_pnl_events.
@@ -2760,7 +2813,7 @@ async def upsert_bitget_funding_fees(
                 if id_less_than is not None:
                     params["idLessThan"] = id_less_than
 
-                data = await bitget_get("/api/v2/mix/account/bill", params)
+                data = await bitget_get("/api/v2/mix/account/bill", params, creds)
                 records = data.get("data") or []
                 if isinstance(records, dict):
                     records = records.get("bills") or records.get("list") or []
@@ -2893,6 +2946,7 @@ async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
     ]
 
     results = {}
+    creds = get_bitget_creds("Global")
 
     for product_type in product_types:
         product_result = {}
@@ -2903,6 +2957,7 @@ async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
                 {
                     "productType": product_type,
                 },
+                creds,
             )
         except Exception as e:
             product_result["orders_pending_error"] = str(e)
@@ -2917,6 +2972,7 @@ async def debug_bitget_tpsl(x_admin_token: Optional[str] = Header(None)):
                         "productType": product_type,
                         "planType": plan_type,
                     },
+                    creds,
                 )
             except Exception as e:
                 product_result["plan_orders"][f"{plan_type}_error"] = str(e)
@@ -2994,6 +3050,12 @@ async def run_bitget_sync_job(jobs: list):
                 portfolio_id = portfolio_row["id"]
                 base_currency = portfolio_row["base_currency"]
 
+                # Resolve the per-portfolio Bitget credential set ONCE, then
+                # thread it through every downstream call. No silent fallback: a
+                # missing Alternatives set raises here and fails THIS portfolio's
+                # job (caught below) — it never mirrors the Global account.
+                creds = get_bitget_creds(portfolio_name)
+
                 portfolio_seen = 0
                 portfolio_inserted = 0
                 portfolio_updated = 0
@@ -3003,6 +3065,7 @@ async def run_bitget_sync_job(jobs: list):
                     data = await bitget_get(
                         "/api/v2/mix/order/fill-history",
                         {"productType": product_type, "limit": "100"},
+                        creds,
                     )
 
                     rows = data.get("data") or []
@@ -3027,6 +3090,7 @@ async def run_bitget_sync_job(jobs: list):
                     portfolio_name,
                     portfolio_id,
                     base_currency,
+                    creds,
                 )
 
                 # A2.2 — import perpetual-futures funding fees
@@ -3035,9 +3099,12 @@ async def run_bitget_sync_job(jobs: list):
                     portfolio_name,
                     portfolio_id,
                     base_currency,
+                    creds,
                 )
 
-                snapshot_result = await upsert_bitget_snapshot_and_positions(conn, portfolio_name)
+                snapshot_result = await upsert_bitget_snapshot_and_positions(
+                    conn, portfolio_name, creds
+                )
 
                 await finish_import_job(
                     conn,
@@ -3047,6 +3114,7 @@ async def run_bitget_sync_job(jobs: list):
                     rows_inserted=portfolio_inserted,
                     rows_updated=portfolio_updated,
                     metadata={
+                        "creds_source": creds["source"],  # GLOBAL/ALTERNATIVES — never a secret
                         "results": results,
                         "cashflows": cashflow_result,
                         "funding_fees": funding_fee_result,
