@@ -2152,6 +2152,118 @@ async def debug_bitget_account(x_admin_token: Optional[str] = Header(None)):
         return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
 
 
+@app.post("/debug/verify/separation")
+async def debug_verify_separation(x_admin_token: Optional[str] = Header(None)):
+    """Read-only Vorab-Verifikation des Cutovers: beweist, dass Global und
+    Alternatives auf physisch GETRENNTE Konten zeigen — OHNE echte
+    Kontonummern oder Secrets auszugeben. Kein DB-Write.
+
+    IBKR: zieht beide Flex-Queries, gibt je einen anonymisierten
+      Diskriminator SHA256(accountId)[:12] zurück + accounts_differ.
+      Roh-ErrorMessage von IBKR wird unmaskiert durchgereicht (zur Diagnose).
+    Bitget: nur Boolean global_key_equals_alternatives + je USDT-Equity,
+      plus (falls Spot-Scope aktiv) anonymisierter userId-Vergleich.
+      Key/Secret/Passphrase werden NIEMALS ausgegeben.
+    """
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    def _h(value: str) -> str:
+        return hashlib.sha256(str(value).encode()).hexdigest()[:12]
+
+    # ---------- IBKR ----------
+    ibkr: dict = {}
+    for label, env_name in [
+        ("Global", "IBKR_ACTIVITY_QUERY_ID_GLOBAL"),
+        ("Alternatives", "IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES"),
+    ]:
+        entry: dict = {}
+        query_id = os.getenv(env_name)
+        entry["query_present"] = bool(query_id)
+        if not query_id:
+            entry["error"] = f"{env_name} missing"
+            ibkr[label] = entry
+            continue
+        try:
+            xml_text = await fetch_ibkr_flex_report(query_id)
+            root = ET.fromstring(xml_text)
+            account_ids: set = set()
+            ibkr_error_code = None
+            ibkr_error_message = None
+            for elem in root.iter():
+                tag = elem.tag.split("}")[-1].lower()
+                if tag == "errorcode":
+                    ibkr_error_code = elem.text
+                elif tag == "errormessage":
+                    ibkr_error_message = elem.text
+                for k, v in elem.attrib.items():
+                    if k.lower() in ("accountid", "accountnumber", "acctid") and v:
+                        account_ids.add(v)
+            entry["account_hashes"] = sorted(_h(a) for a in account_ids)
+            entry["account_count"] = len(account_ids)
+            if ibkr_error_code or ibkr_error_message:
+                # Roh durchgereicht (kein Kontonummer-Leak: IBKR-Fehlertexte
+                # enthalten keine Kontonummern).
+                entry["ibkr_error_code"] = ibkr_error_code
+                entry["ibkr_error_message"] = ibkr_error_message
+        except Exception as e:
+            entry["error"] = str(e)
+        ibkr[label] = entry
+
+    g_hashes = set(ibkr.get("Global", {}).get("account_hashes") or [])
+    a_hashes = set(ibkr.get("Alternatives", {}).get("account_hashes") or [])
+    if g_hashes and a_hashes:
+        ibkr["accounts_differ"] = g_hashes.isdisjoint(a_hashes)
+    else:
+        ibkr["accounts_differ"] = None  # unbekannt (mind. eine Query lieferte kein Statement)
+
+    # ---------- Bitget ----------
+    bitget: dict = {}
+    try:
+        gc = get_bitget_creds("Global")
+        ac = get_bitget_creds("Alternatives")
+        bitget["global_key_equals_alternatives"] = (gc["api_key"] == ac["api_key"])
+
+        spot_user_hashes: dict = {}
+        for label, creds in [("Global", gc), ("Alternatives", ac)]:
+            side: dict = {}
+            try:
+                acct = await bitget_get(
+                    "/api/v2/mix/account/accounts",
+                    {"productType": "USDT-FUTURES"},
+                    creds,
+                )
+                data = acct.get("data") or []
+                side["usdt_futures_equity"] = data[0].get("accountEquity") if data else None
+            except Exception as ex:
+                side["equity_error"] = str(ex)
+            try:
+                spot = await bitget_get("/api/v2/spot/account/info", {}, creds)
+                uid = (spot.get("data") or {}).get("userId")
+                if uid:
+                    h = _h(uid)
+                    side["spot_user_hash"] = h
+                    spot_user_hashes[label] = h
+                else:
+                    side["spot_user_hash"] = None
+            except Exception as ex:
+                side["spot_error"] = str(ex)
+            bitget[label] = side
+
+        if "Global" in spot_user_hashes and "Alternatives" in spot_user_hashes:
+            bitget["spot_user_differs"] = (
+                spot_user_hashes["Global"] != spot_user_hashes["Alternatives"]
+            )
+        else:
+            bitget["spot_user_differs"] = None  # Spot-Scope nicht aktiv → kein definitiver Beweis
+    except Exception as e:
+        bitget["error"] = str(e)
+
+    return JSONResponse(content={"status": "success", "ibkr": ibkr, "bitget": bitget})
+
+
 def bitget_side_to_side(row: dict):
     side = (
         row.get("side")
