@@ -874,9 +874,6 @@ async def fetch_ibkr_flex_report(query_id: str):
         if not ref_code:
             raise RuntimeError(f"IBKR ReferenceCode missing: {send_text[:1000]}")
 
-        # IBKR sometimes needs a short delay before report retrieval.
-        await asyncio.sleep(20)
-
         fetch_url = f"{base_url}/GetStatement"
         fetch_params = {
             "t": token,
@@ -884,13 +881,72 @@ async def fetch_ibkr_flex_report(query_id: str):
             "v": "3",
         }
 
-        fetch_resp = await client.get(fetch_url, params=fetch_params)
-        fetch_text = fetch_resp.text.strip()
+        # Poll GetStatement on the SAME reference code until the statement is
+        # ready. While IBKR is still building the report it returns ErrorCode
+        # 1019 ("Statement generation in progress") — that is transient and MUST
+        # be retried on the same reference code; issuing a fresh SendRequest each
+        # time would restart generation and never finish for slow/large queries.
+        #
+        # Failure policy (correctness over silent gaps):
+        #   - 1019                -> transient, keep polling until the deadline.
+        #   - any other ErrorCode -> hard fail immediately (do NOT poll 180s on a
+        #                            real error like an expired token or invalid
+        #                            query — those already fail at SendRequest,
+        #                            but we guard here too).
+        #   - deadline reached     -> hard fail (raise), so the caller marks the
+        #                            sync job "failed" instead of importing a
+        #                            silently empty (0-row) statement as success.
+        retryable_error_codes = {"1019"}
+        max_wait_seconds = 180
+        poll_interval = 8
+        deadline = time.monotonic() + max_wait_seconds
 
-        if not fetch_text:
-            raise RuntimeError("IBKR GetStatement returned empty response")
+        # Initial grace period before the first poll (statements are never ready
+        # instantly after SendRequest).
+        await asyncio.sleep(poll_interval)
 
-        return fetch_text
+        while True:
+            fetch_resp = await client.get(fetch_url, params=fetch_params)
+            fetch_text = fetch_resp.text.strip()
+
+            if not fetch_text:
+                raise RuntimeError("IBKR GetStatement returned empty response")
+
+            error_code = None
+            error_message = None
+            try:
+                fetch_root = ET.fromstring(fetch_text)
+            except Exception:
+                fetch_root = None
+
+            if fetch_root is not None:
+                for elem in fetch_root.iter():
+                    tag = elem.tag.lower()
+                    if tag.endswith("errorcode"):
+                        error_code = (elem.text or "").strip()
+                    elif tag.endswith("errormessage"):
+                        error_message = (elem.text or "").strip()
+
+            # No error envelope -> this is the real statement.
+            if not error_code:
+                return fetch_text
+
+            # Transient "still generating" -> retry until the deadline.
+            if error_code in retryable_error_codes:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"IBKR statement not ready after {max_wait_seconds}s "
+                        f"(query_id={query_id}): error_code={error_code}, "
+                        f"error_message={error_message}"
+                    )
+                await asyncio.sleep(poll_interval)
+                continue
+
+            # Any other error code -> hard fail immediately.
+            raise RuntimeError(
+                f"IBKR GetStatement failed (query_id={query_id}): "
+                f"error_code={error_code}, error_message={error_message}"
+            )
 
 @app.post("/debug/ibkr/tags")
 async def debug_ibkr_tags(x_admin_token: Optional[str] = Header(None)):
