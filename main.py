@@ -2161,6 +2161,138 @@ async def fetch_bitget_tpsl_map(product_type: str, creds: dict):
     return result
 
 
+# Coins treated as 1.0 USDT (face value). Bitget's USDT/USDC settled wallets and
+# common stablecoins in spot are valued at par instead of via a ticker.
+BITGET_STABLE_COINS = {
+    "USDT", "USDC", "DAI", "TUSD", "USDD", "FDUSD", "BUSD", "USDE", "USDP", "GUSD",
+}
+
+
+async def fetch_bitget_spot_price(coin: str, creds: dict) -> float:
+    """
+    Last spot price of `coin` expressed in USDT, via the public spot ticker.
+    Stablecoins return 1.0. Raises RuntimeError if the price is unreadable so the
+    caller can graceful-skip that single coin (it must NOT fail the whole snapshot).
+    """
+    c = (coin or "").strip().upper()
+    if not c:
+        raise RuntimeError("empty coin symbol")
+    if c in BITGET_STABLE_COINS:
+        return 1.0
+    resp = await bitget_get(
+        "/api/v2/spot/market/tickers",
+        {"symbol": f"{c}USDT"},
+        creds,
+    )
+    rows = resp.get("data") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not rows:
+        raise RuntimeError(f"no ticker for {c}USDT")
+    last = parse_decimal(rows[0].get("lastPr"), None)
+    if last is None or last == 0:
+        raise RuntimeError(f"no usable lastPr for {c}USDT")
+    return last
+
+
+async def bitget_mix_equity_usdt(product_type: str, creds: dict):
+    """
+    Total account equity of a mix product line ('USDC-FUTURES', 'COIN-FUTURES', ...)
+    expressed in USDT, plus a list of per-coin skips.
+
+    Valuation source priority (per account row):
+      1. Bitget's own `usdtEquity` field, IF present and > 0. This is the
+         exchange's AUTHORITATIVE USDT valuation — we deliberately prefer it so
+         that later validation against the Bitget app shows the same number
+         instead of tiny drift from our own ticker math.
+      2. Fallback only when usdtEquity is missing/null/0 but `accountEquity`
+         (denominated in marginCoin) is present:
+            - stablecoin margin (USDT/USDC/...) → par (1:1)
+            - other margin coins (BTC/ETH/...) → accountEquity * spot ticker
+         A single unreadable ticker skips only that coin (appended to `skipped`),
+         it does NOT abort the wallet.
+
+    !!! NOT LIVE-VERIFIED !!!
+    The USDC-FUTURES / COIN-FUTURES paths cannot currently be verified: both
+    wallets are empty and return 40009 (product line not activated). This logic
+    is built defensively (graceful-skip) but its arithmetic is UNVALIDATED. On
+    the first real USDC-M / Coin-M trade it MUST be cross-checked against the
+    Bitget app to ensure it does not silently compute a wrong NAV.
+
+    Raises only if the accounts API call itself fails (e.g. 40009 on an
+    unactivated product line) so the caller can graceful-skip the whole wallet.
+    Returns: (value_in_usdt: float, skipped: list[dict])
+    """
+    data = await bitget_get(
+        "/api/v2/mix/account/accounts",
+        {"productType": product_type},
+        creds,
+    )
+    rows = data.get("data") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+
+    total = 0.0
+    skipped = []
+    for acct in rows:
+        # 1. Prefer Bitget's authoritative USDT valuation.
+        usdt_equity = parse_decimal(acct.get("usdtEquity"), 0)
+        if usdt_equity > 0:
+            total += usdt_equity
+            continue
+
+        # 2. Fallback: value the margin-coin equity ourselves.
+        equity = parse_decimal(acct.get("accountEquity"), 0)
+        if equity == 0:
+            continue
+        coin = (acct.get("marginCoin") or "").strip().upper()
+        if coin in BITGET_STABLE_COINS:
+            total += equity
+            continue
+        try:
+            price = await fetch_bitget_spot_price(coin, creds)
+            total += equity * price
+        except Exception as e:
+            skipped.append({"wallet": product_type, "coin": coin, "reason": str(e)[:160]})
+    return total, skipped
+
+
+async def bitget_spot_value_usdt(creds: dict):
+    """
+    Total spot wallet value in USDT: stablecoins at face value, other coins via
+    spot ticker. A single unreadable ticker skips only that coin.
+
+    Raises only if the spot assets API call itself fails so the caller can
+    graceful-skip the whole spot wallet.
+    Returns: (value_in_usdt: float, skipped: list[dict])
+    """
+    data = await bitget_get("/api/v2/spot/account/assets", {}, creds)
+    rows = data.get("data") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+
+    total = 0.0
+    skipped = []
+    for asset in rows:
+        coin = (asset.get("coin") or "").strip().upper()
+        amount = (
+            parse_decimal(asset.get("available"), 0)
+            + parse_decimal(asset.get("frozen"), 0)
+            + parse_decimal(asset.get("locked"), 0)
+        )
+        if amount == 0:
+            continue
+        if coin in BITGET_STABLE_COINS:
+            total += amount
+            continue
+        try:
+            price = await fetch_bitget_spot_price(coin, creds)
+            total += amount * price
+        except Exception as e:
+            skipped.append({"wallet": "SPOT", "coin": coin, "reason": str(e)[:160]})
+    return total, skipped
+
+
 @app.post("/debug/bitget/account")
 async def debug_bitget_account(x_admin_token: Optional[str] = Header(None)):
     try:
@@ -2477,9 +2609,64 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str, creds:
     now_dt = datetime.now(timezone.utc)
     snapshot_date = now_dt.date()
 
-    nav = parse_decimal(account.get("accountEquity") or account.get("usdtEquity"), 0)
+    # --- Composite NAV in USDT ----------------------------------------------
+    # nav = USDT-FUTURES equity (base, just fetched)
+    #     + USDC-FUTURES equity (USDC ~= 1:1 USDT)
+    #     + COIN-FUTURES equity (coin amount * spot ticker)
+    #     + Spot wallet (stables at face value + coins * spot ticker)
+    #
+    # Each non-base wallet is valued with graceful-skip: a 40009 / unreadable
+    # wallet (or a single unreadable coin ticker) is logged in
+    # `skipped_valuations` and excluded from the sum — it NEVER fails the whole
+    # snapshot. Exactly ONE row per (portfolio,'Bitget',date,currency='USDT')
+    # is written, so v_portfolio_daily_nav (LIMIT 1) and TWR/MWR stay correct.
+    usdt_futures_equity = parse_decimal(
+        account.get("accountEquity") or account.get("usdtEquity"), 0
+    )
     cash = parse_decimal(account.get("available"), 0)
     open_pnl = parse_decimal(account.get("unrealizedPL"), 0)
+
+    composite_nav = usdt_futures_equity
+    nav_breakdown = {"USDT-FUTURES": usdt_futures_equity}
+    skipped_valuations = []
+
+    # USDC-FUTURES / COIN-FUTURES below: NOT LIVE-VERIFIED. Both wallets are
+    # currently empty (40009, product line not activated), so this valuation
+    # has never run against real balances. It prefers Bitget's own usdtEquity
+    # (authoritative) and only falls back to our coin*ticker math. On the first
+    # real USDC-M / Coin-M trade, cross-check the resulting NAV against the
+    # Bitget app before trusting it. See bitget_mix_equity_usdt() docstring.
+    #
+    # USDC-FUTURES (USDC ~= 1:1 USDT)
+    try:
+        v, sk = await bitget_mix_equity_usdt("USDC-FUTURES", creds)
+        composite_nav += v
+        nav_breakdown["USDC-FUTURES"] = v
+        skipped_valuations.extend(sk)
+    except Exception as e:
+        skipped_valuations.append({"wallet": "USDC-FUTURES", "reason": str(e)[:200]})
+
+    # COIN-FUTURES (coin-margined; prefers usdtEquity, else equity-in-coin * ticker)
+    try:
+        v, sk = await bitget_mix_equity_usdt("COIN-FUTURES", creds)
+        composite_nav += v
+        nav_breakdown["COIN-FUTURES"] = v
+        skipped_valuations.extend(sk)
+    except Exception as e:
+        skipped_valuations.append({"wallet": "COIN-FUTURES", "reason": str(e)[:200]})
+
+    # Spot wallet (stables face value + coins * spot ticker)
+    try:
+        v, sk = await bitget_spot_value_usdt(creds)
+        composite_nav += v
+        nav_breakdown["SPOT"] = v
+        skipped_valuations.extend(sk)
+    except Exception as e:
+        skipped_valuations.append({"wallet": "SPOT", "reason": str(e)[:200]})
+
+    nav = composite_nav
+    # market_value = everything that is not USDT-FUTURES free cash (positions +
+    # all non-base wallets). cash / open_pnl stay USDT-FUTURES-native.
     market_value = nav - cash
 
     await conn.execute(
@@ -2683,6 +2870,9 @@ async def upsert_bitget_snapshot_and_positions(conn, portfolio_name: str, creds:
         "snapshot_imported": True,
         "currency": "USDT",
         "nav": nav,
+        "nav_usdt_futures": usdt_futures_equity,
+        "nav_breakdown": nav_breakdown,
+        "skipped_valuations": skipped_valuations,
         "cash": cash,
         "market_value": market_value,
         "open_pnl": open_pnl,
