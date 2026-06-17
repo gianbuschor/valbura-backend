@@ -3618,23 +3618,39 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
         if not usd_chf:
             raise RuntimeError("USDCHF rate missing from FX API")
 
+        # IMPORTANT — stablecoin handling:
+        #   Stablecoins (USDT, USDC) are set ~1 USD, so they are made equal to
+        #   *each other and to USD only*. The conversion to a fiat target (CHF,
+        #   EUR) then runs through the REAL fiat rate (usd_chf / usd_eur).
+        #   => USDT→CHF and USDC→CHF both take the SAME real `usd_chf` rate.
+        #      They are NOT 1:1 to CHF (that was a past bug); 1.0 is used ONLY
+        #      for stable→USD and the self-identities.
         rows = [
-            ("USD", "CHF", usd_chf, "open_er_api"),
+            # --- to CHF (base currency): REAL usd_chf for USD and both stables
+            ("USD",  "CHF", usd_chf, "open_er_api"),
             ("USDT", "CHF", usd_chf, "open_er_api_usdt_as_usd"),
-            ("USD", "USD", 1, "system"),
+            ("USDC", "CHF", usd_chf, "open_er_api_usdc_as_usd"),
+            # --- to USD: stables ~1 USD (1.0), USD self-identity
+            ("USD",  "USD", 1, "system"),
+            ("USDT", "USD", 1, "system_usdt_as_usd"),
+            ("USDC", "USD", 1, "system_usdc_as_usd"),
+            # --- self-identities
             ("USDT", "USDT", 1, "system"),
-            ("CHF", "CHF", 1, "system"),
+            ("USDC", "USDC", 1, "system"),
+            ("CHF",  "CHF",  1, "system"),
         ]
 
         if usd_eur:
-            rows.append(("USD", "EUR", usd_eur, "open_er_api"))
+            # to EUR: REAL usd_eur for USD and both stables; EUR self-identity
+            rows.append(("USD",  "EUR", usd_eur, "open_er_api"))
             rows.append(("USDT", "EUR", usd_eur, "open_er_api_usdt_as_usd"))
-            rows.append(("EUR", "EUR", 1, "system"))
+            rows.append(("USDC", "EUR", usd_eur, "open_er_api_usdc_as_usd"))
+            rows.append(("EUR",  "EUR", 1, "system"))
 
         if usd_gbp:
-            rows.append(("USD", "GBP", usd_gbp, "open_er_api"))
+            rows.append(("USD",  "GBP", usd_gbp, "open_er_api"))
             rows.append(("USDT", "GBP", usd_gbp, "open_er_api_usdt_as_usd"))
-            rows.append(("GBP", "GBP", 1, "system"))
+            rows.append(("GBP",  "GBP", 1, "system"))
 
         for from_currency, to_currency, rate, source in rows:
             await conn.execute(
@@ -3664,6 +3680,18 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
                 "usd_eur": usd_eur,
                 "usd_gbp": usd_gbp,
                 "rows_upserted": len(rows),
+                # Echo the exact rows upserted (read-only, no secrets) so the
+                # stablecoin->fiat conversion can be verified without direct DB
+                # access: USD/USDT/USDC -> CHF must all equal the real usd_chf.
+                "rows": [
+                    {
+                        "from_currency": f,
+                        "to_currency": t,
+                        "rate": r,
+                        "source": s,
+                    }
+                    for (f, t, r, s) in rows
+                ],
             }
         )
 
