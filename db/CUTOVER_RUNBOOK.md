@@ -389,3 +389,4 @@ Die bestehende Sync-Pipeline (Cron + `/sync/*`) erfasst ab dann automatisch real
 - FX-Backfill (`fx_rates`-Lücken → weniger `skipped_no_fx`).
 - `/sync/ibkr/trigger`-Alias nach Go-Live entfernen.
 - Optionale Härtung des IBKR-Alternatives-Fallbacks (Schritt 5, „hart fehlschlagen statt Global ziehen").
+- `db/schema.sql` nach Go-Live sauber **re-baselinen**: alle Migrationen (0001 xirr/MWR, 0002 fx_to_display, sowie alle folgenden Block-2-Migrationen) per Introspektion in einen vollständigen aktuellen Snapshot einfalten. Aktuell bleibt schema.sql bewusst der reine PRE-A3-Baseline-Snapshot; die `migrations/`-Reihe ist das Versions-Log.
