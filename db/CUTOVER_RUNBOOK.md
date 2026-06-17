@@ -15,6 +15,23 @@ Weil Phase 1 gegen **echte, aber leere** Konten läuft, sind die Wallets (USDT-M
 
 ---
 
+## Timing & aktueller Stand (verbindlich)
+
+**Schritt 0 (Vorbedingungen) ist KOMPLETT ABGEHAKT** — siehe abgehakte Liste in Schritt 0. Beide Broker sind **verifiziert getrennt**, der IBKR-Hard-Fail-Fix ist deployed, der Composite-NAV ist gebaut und am echten (leeren) Konto mechanisch verifiziert, und die echten ENV-Variablen sind in Railway gesetzt.
+
+**Die ausführenden Schritte werden bewusst gebündelt auf KURZ VOR/AM 01.07. gelegt:**
+
+| Schritt | Wann | Warum dieses Timing |
+|---------|------|---------------------|
+| **1 Vorher-Bild**, **2 Backup**, **3 Löschen** | **am Cutover-Tag (idealerweise = Tag des Geldtransfers)** | Konten bleiben durch den Transfer/Trades **stabil aktiv** (leere IBKR-Konten schliefen sonst ein). |
+| **6 Erster echter Sync** | **direkt danach, am selben Tag** | Der erste Sync sieht dann **gleich echte Daten** statt leerer Konten. |
+
+> **Backup frisch am Cutover-Tag:** Schritt 2 (sowohl der In-DB-Snapshot 2.a als auch ein evtl. Plattform-Backup 2.b) wird **an dem Tag** erstellt, **nicht vorher** — ein vorab gemachtes Backup wäre zum Lösch-Zeitpunkt veraltet (zwischenzeitliche Syncs).
+
+**Vorgezogen & bereits erledigt** (unabhängig vom Lösch-Tag, weil rein additiv/Code): Schritt **5** (ENV-Gegencheck-Logik), Schritt **7** (NAV-Composite, Commit `3cfc8ca`). Schritt **4** (ENV) ist gesetzt; nur der finale Redeploy-Zeitpunkt richtet sich nach dem Cutover-Tag.
+
+---
+
 ## Grundregeln (gelten für jeden Schritt)
 
 - **Sicherheit:** Das DB-Passwort kommt bewusst **nicht** in die Session. Alle DB-Operationen laufen über die Supabase-MCP-Introspektion oder über das Supabase-Dashboard. Secrets (API-Key/Secret/Passphrase) landen **niemals** in Logs, `metadata` oder `error_message` — nur `creds_source` (Name).
@@ -29,18 +46,20 @@ Weil Phase 1 gegen **echte, aber leere** Konten läuft, sind die Wallets (USDT-M
 Phase 1 startet **erst**, wenn **alle** Punkte abgehakt sind. Fehlt einer, abbrechen.
 
 ### 0.1 Bitget — beide Konten
-- [ ] Echter **Bitget-API-Key für Global** vorhanden (Key + Secret + Passphrase).
-- [ ] Echter **Bitget-API-Key für Alternatives** vorhanden (Key + Secret + Passphrase) — **physisch anderes Konto** als Global (sonst keine echte Trennung, nur Spiegelung).
-- [ ] Am echten Bitget-Konto sind **USDC-M Futures** und **Coin-M Futures** als Produktlinien **aktiviert**.
-- [ ] Key-Scope deckt **alle benötigten Produktlinien** ab: USDT-M, USDC-M, Coin-M Futures **und** Spot (Read-Permission genügt; **kein** Trade/Withdraw nötig).
-- [ ] IP-Whitelist des Keys (falls gesetzt) enthält die **Railway-Ausgangs-IP** — sonst 40xx trotz korrektem Key.
+- [x] Echter **Bitget-API-Key für Global** vorhanden (Key + Secret + Passphrase). *(echte ENV in Railway gesetzt)*
+- [x] Echter **Bitget-API-Key für Alternatives** vorhanden (Key + Secret + Passphrase) — **physisch anderes Konto** als Global. *(Verifiziert über `POST /debug/verify/separation`: `global_key_equals_alternatives=false` **und** `spot_user_differs=true` — verschiedene Spot-userIds → echt verschiedene Konten, keine Spiegelung.)*
+- [x] Am echten Bitget-Konto sind **USDC-M Futures** und **Coin-M Futures** als Produktlinien **aktiviert**. *(Bestätigt: echter Sync liefert für USDC-/COIN-FUTURES `00000`+leer statt `40009` → Produktlinien aktiv. Der 40009 war ein Testkey-Artefakt.)*
+- [x] Key-Scope deckt **alle benötigten Produktlinien** ab: USDT-M, USDC-M, Coin-M Futures **und** Spot (Read genügt). *(Snapshot ruft alle vier Wallets fehlerfrei ab.)*
+- [ ] IP-Whitelist des Keys (falls gesetzt) enthält die **Railway-Ausgangs-IP** — sonst 40xx trotz korrektem Key. *(Implizit ok: Syncs laufen fehlerfrei von Railway aus; nur relevant, falls später eine Whitelist gesetzt wird.)*
 
-> **Warum:** Phase 1 verifiziert u. a., dass **keine** 40037/40009-Fehler mehr auftreten. Das geht nur, wenn echte Keys mit voller Produktlinien-Abdeckung gesetzt sind.
+> **Warum:** Phase 1 verifiziert u. a., dass **keine** 40037/40009-Fehler mehr auftreten. Das geht nur, wenn echte Keys mit voller Produktlinien-Abdeckung gesetzt sind. → **Erfüllt.**
 
 ### 0.2 IBKR — beide Konten
-- [ ] Echte **Flex-Query-ID für Global** (`IBKR_ACTIVITY_QUERY_ID_GLOBAL`).
-- [ ] Echte **Flex-Query-ID für Alternatives** (`IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES`) — **eigene** Query, **nicht** dieselbe wie Global (sonst greift die Fallback-Falle, siehe Schritt 5).
-- [ ] `IBKR_FLEX_TOKEN` gültig und deckt beide Queries ab.
+- [x] Echte **Flex-Query-ID für Global** (`IBKR_ACTIVITY_QUERY_ID_GLOBAL`). *(echte ENV gesetzt; Query liefert nach IBKR-Reaktivierung ein Statement.)*
+- [x] Echte **Flex-Query-ID für Alternatives** (`IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES`) — **eigene** Query, **nicht** dieselbe wie Global. *(Verifiziert: `POST /debug/verify/separation` zeigt `accounts_differ=true` — zwei verschiedene Sub-Konten.)*
+- [x] `IBKR_FLEX_TOKEN` gültig und deckt beide Queries ab. *(echte ENV gesetzt; beide Queries liefern Statements.)*
+
+> **Zusätzlich erledigt (Code):** Der **stille 0-Zeilen-Bug** in `fetch_ibkr_flex_report` ist gefixt (Commit `de091b1`: pollt dieselbe Reference-Code, hard-fail statt still 0 Zeilen). Der **Composite-NAV** ist gebaut/deployed (Commit `3cfc8ca`).
 
 ### 0.3 Backup-Fähigkeit vorab klären (plan-abhängig!)
 - [ ] Im **Supabase-Dashboard → Database → Backups** prüfen, ob **automatische Backups / PITR überhaupt verfügbar** sind. Das ist **plan-abhängig** — auf kleineren Plänen (z. B. Free) gibt es **kein** Plattform-Backup/PITR.
@@ -50,6 +69,8 @@ Phase 1 startet **erst**, wenn **alle** Punkte abgehakt sind. Fehlt einer, abbre
 
 ### 0.4 Bestätigung dokumentieren
 - [ ] User bestätigt schriftlich in der Session: „Alle 0.1/0.2-Punkte erfüllt, Backup-Fähigkeit aus 0.3 geklärt." → erst dann Schritt 1.
+
+> **Stand:** 0.1 und 0.2 sind **erfüllt und verifiziert** (siehe oben). **0.3 (Backup-Fähigkeit) und 0.4 (finale Go-Bestätigung) sind bewusst auf den Cutover-Tag terminiert** — konsistent mit „Backup frisch am Tag" (siehe Abschnitt *Timing & aktueller Stand*). Der inhaltliche Block der Vorbedingungen (Broker-Trennung, Keys/Queries, Code-Fixes, NAV, ENV) ist damit **komplett abgehakt**; offen bleibt nur das, was per Definition am Lösch-Tag passiert.
 
 **STOPP 0:** Ohne vollständige Checkliste kein Schritt 1.
 
@@ -280,6 +301,8 @@ Jetzt erst sinnvoll, weil die echten Wallets lesbar sind (USDT-M/USDC-M/Coin-M/S
 
 **STOPP 7:** Dry-Run plausibel; Implementierung ist ein **eigener** freigabepflichtiger Vorgang, **nicht** Teil dieses Runbook-Laufs.
 
+> **Status (erledigt, vorgezogen):** Der Composite-NAV ist **gebaut, deployed und am echten (leeren) Konto mechanisch verifiziert** (Commit `3cfc8ca`): USDT-M bit-identisch zum alten NAV, **eine** USDT-Zeile, kein Crash, `nav_breakdown` getrennt je Wallet, beide `creds_source` korrekt. **Aber:** Zwei Pfade blieben am leeren Konto **unverifiziert** und gehören deshalb in die **Phase-2-Verifikation** (siehe unten): (1) der **graceful-skip** (USDC/COIN lieferten `00000`+leer statt `40009`, der Skip-Zweig wurde nie ausgelöst); (2) die **USDC-/COIN-/Spot-Bewertungsarithmetik** (nie gegen echte Beträge gelaufen).
+
 ---
 
 ## Schritt 8 — Cron reaktivieren
@@ -324,6 +347,39 @@ Die bestehende Sync-Pipeline (Cron + `/sync/*`) erfasst ab dann automatisch real
 **Optionaler Sanity-Check am 01.07.** (rein beobachtend, kein Eingriff):
 - [ ] Nach dem ersten Transfer einen Sync abwarten → NAV je Portfolio spiegelt den Transfer wider.
 - [ ] Keine `40037`/`40009`-Fehler (wären sonst schon in Phase 1 aufgefallen).
+
+---
+
+## Phase-2-Verifikation (am/nach 01.07., mit echtem Geld)
+
+**Warum eine eigene Checkliste:** Mehrere Eigenschaften lassen sich **prinzipiell nicht** an leeren Konten prüfen — sie brauchen echte Bestände, echte Trades und IBKR-Konten, die durch Aktivität wach bleiben. Phase 1 hat die **Mechanik** abgesichert (Anbindung, Trennung, eine NAV-Zeile, kein Crash); Phase 2 verifiziert die **Inhalte/Beträge**. Diese Checkliste ist **beobachtend** — kein Löschen, keine ENV-Änderung, kein Code (außer evtl. einem Bugfix, falls ein Check rot ist, dann als eigener freigabepflichtiger Vorgang).
+
+> Voraussetzung: Geld ist transferiert, erste Trades/Bestände existieren, und mindestens **ein** vollständiger Sync-Lauf (Bitget + IBKR) ist nach dem Transfer durchgelaufen.
+
+### P2.1 IBKR-Stabilität (Konten bleiben mit Geld wach)
+- [ ] Beide Flex-Queries liefern **nach** dem Geldtransfer **stabil** ein Statement — kein `1019`-Dauer-Timeout mehr. (Hintergrund: leere Konten wurden von IBKR nacheinander inaktiviert; mit Kapital/Aktivität sollten sie aktiv bleiben.)
+- [ ] **Global UND Alternatives** je **ein** Statement; `accounts_differ` bleibt **`true`** (über `POST /debug/verify/separation`).
+- [ ] Über mehrere Tage/Sync-Läufe **kein** stiller 0-Zeilen-Fall mehr (der Hard-Fail-Fix `de091b1` würde sonst `failed` setzen — `import_jobs.status`/`error_message` prüfen).
+
+### P2.2 NAV — USDC-/COIN-Bewertung gegen die Bitget-App
+- [ ] Sobald **echte USDC-M / Coin-M-Bestände** existieren: Composite-`nav` (USDT) gegen die Bitget-App **„Total Assets in USDT"** der jeweiligen Produktlinie gegenprüfen (kleine Abweichung durch Zeitpunkt/Kurs ok, Größenordnung muss stimmen).
+- [ ] Damit ist die in Phase 1 **unverifizierte Bewertungsarithmetik** (Code-Caveat in `bitget_mix_equity_usdt`) erstmals gegen echte Beträge belegt.
+- [ ] Falls eine Produktlinie **doch** `40009` o. ä. liefert: prüfen, dass der **graceful-skip** greift (`metadata.snapshot.skipped_valuations` enthält den Eintrag, Snapshot bleibt `success`, eine USDT-Zeile) — das ist die erstmalige Live-Auslösung des Skip-Pfads.
+
+### P2.3 NAV — Spot-Bewertung gegen die App
+- [ ] Sobald **Spot-Bestände** da sind: die `coin × spot lastPr`-Bewertung gegen die App-Anzeige (Spot-Wallet-Wert in USDT) gegenprüfen; Stables zu Face Value.
+- [ ] Einzelner Coin ohne Ticker → Eintrag in `skipped_valuations`, Snapshot trotzdem `success` (Skip-Granularität auf Coin-Ebene verifizieren).
+
+### P2.4 Echte Trennung im Betrieb (Spiegelung endgültig aufgelöst)
+- [ ] Global und Alternatives zeigen **unterschiedliche** NAVs **und** unterschiedliche Trades/Positionen — nicht mehr identisch gespiegelt.
+- [ ] Stichprobe: mindestens ein Trade/eine Position existiert in **genau einem** der beiden Portfolios, nicht in beiden.
+- [ ] `creds_source` bleibt je Portfolio korrekt (`GLOBAL` / `ALTERNATIVES`), IBKR `accounts_differ: true`. Das ist der **finale** Beweis, dass die Test-Spiegelung wirklich aufgelöst ist.
+
+### P2.5 TWR/MWR-Plausibilität
+- [ ] Erste echte Renditen (TWR/MWR) sind plausibel und enthalten **keine** künstlichen Sprünge aus der NAV-Umstellung. (Erwartung: keine, da die Historie nach dem Cutover **frisch** beginnt und die eine-Zeile-Invariante gewahrt ist.)
+- [ ] Erster Cashflow (Kapital-Transfer) erscheint als Einzahlung in `portfolio_cashflows`, nicht als NAV-Gewinn → TWR durch den Transfer **nicht** verzerrt.
+
+**STOPP P2:** Erst wenn P2.1–P2.4 grün sind, gilt der Cutover als **inhaltlich** (nicht nur mechanisch) bestätigt. Ein roter Check ist **kein** Notfall, aber Auslöser für einen gezielten, freigabepflichtigen Fix (z. B. Bewertungsarithmetik korrigieren) — **vor** breiterem Vertrauen in die NAV-Zahlen.
 
 ---
 
