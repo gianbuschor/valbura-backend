@@ -3640,17 +3640,49 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
             ("CHF",  "CHF",  1, "system"),
         ]
 
+        # --- CHF fiat-cross pairs (display-currency toggle pivots through CHF):
+        #     CHF->USD = 1 / usd_chf,  CHF->EUR = usd_eur / usd_chf.
+        #     These are DERIVED real fiat cross rates, never literal 1:1.
+        #     usd_chf > 0 is already guaranteed by the `if not usd_chf: raise`
+        #     guard above, so the division is safe (div-by-zero guard).
+        chf_usd = 1.0 / usd_chf
+        rows.append(("CHF", "USD", chf_usd, "open_er_api_chf_cross"))
+
         if usd_eur:
             # to EUR: REAL usd_eur for USD and both stables; EUR self-identity
             rows.append(("USD",  "EUR", usd_eur, "open_er_api"))
             rows.append(("USDT", "EUR", usd_eur, "open_er_api_usdt_as_usd"))
             rows.append(("USDC", "EUR", usd_eur, "open_er_api_usdc_as_usd"))
             rows.append(("EUR",  "EUR", 1, "system"))
+            # CHF->EUR fiat cross (only when usd_eur is present)
+            chf_eur = usd_eur / usd_chf
+            rows.append(("CHF", "EUR", chf_eur, "open_er_api_chf_cross"))
 
         if usd_gbp:
             rows.append(("USD",  "GBP", usd_gbp, "open_er_api"))
             rows.append(("USDT", "GBP", usd_gbp, "open_er_api_usdt_as_usd"))
             rows.append(("GBP",  "GBP", 1, "system"))
+
+        # --- Anti-bug check (parity-SAFE) ----------------------------------
+        #   The past bug class was a stablecoin/fiat pair silently collapsing to
+        #   a literal 1.0 (e.g. USDC->CHF = 1). For the new CHF fiat-crosses the
+        #   analogous bug would be CHF->USD or CHF->EUR landing on 1.0 instead of
+        #   the derived rate. We do NOT flag "rate ~= 1" by magnitude alone:
+        #   CHF/USD and CHF/EUR can LEGITIMATELY trade near parity. Instead we
+        #   flag structurally — a cross that reads ~1 while its underlying USD
+        #   legs are NOT at parity means the real rate was lost.
+        EPS = 1e-4
+        for fc, tc, rt, _src in rows:
+            if fc == "CHF" and tc == "USD" and abs(rt - 1.0) < EPS and abs(usd_chf - 1.0) >= EPS:
+                raise RuntimeError(
+                    f"FX anti-bug: CHF->USD collapsed to ~1.0 but usd_chf={usd_chf} "
+                    f"is not at parity (expected ~{1.0/usd_chf:.4f})"
+                )
+            if fc == "CHF" and tc == "EUR" and abs(rt - 1.0) < EPS and usd_eur and abs(usd_eur - usd_chf) >= EPS:
+                raise RuntimeError(
+                    f"FX anti-bug: CHF->EUR collapsed to ~1.0 but usd_eur={usd_eur}, "
+                    f"usd_chf={usd_chf} are not at parity (expected ~{usd_eur/usd_chf:.4f})"
+                )
 
         for from_currency, to_currency, rate, source in rows:
             await conn.execute(
