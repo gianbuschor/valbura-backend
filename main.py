@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -325,79 +325,137 @@ async def get_fx_rate(
 
 
 # -------------------------
+# Display-currency toggle (Block 2, step 4)
+# -------------------------
+
+# The SIX display currencies the toggle supports. CHF is the portfolio base
+# (fx_to_display => 1, byte-identical to the pre-toggle behaviour). The rest
+# pivot through the CHF base via the get_*_display() SQL wrappers (migration
+# 0003). This allow-list is the SINGLE source of truth for the API layer.
+ALLOWED_DISPLAY_CURRENCIES = ("CHF", "EUR", "USD", "GBP", "JPY", "CNY")
+
+
+def resolve_display_currency(currency: Optional[str]) -> str:
+    """Validate & normalise the ?currency= query param.
+
+    - None / empty            -> default 'CHF' (base; conversion factor 1).
+    - case-insensitive        -> returned upper-cased.
+    - anything else           -> HTTP 400 (NO silent fallback to CHF).
+
+    Performance (TWR/MWR) endpoints do NOT call this — they are always CHF.
+    """
+    if currency is None or currency.strip() == "":
+        return "CHF"
+    normalized = currency.strip().upper()
+    if normalized not in ALLOWED_DISPLAY_CURRENCIES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid currency '{currency}'. "
+                f"Allowed: {', '.join(ALLOWED_DISPLAY_CURRENCIES)}."
+            ),
+        )
+    return normalized
+
+
+def display_list_response(display: str, rows) -> JSONResponse:
+    """Uniform envelope so EVERY value response echoes display_currency,
+    even when the data list is empty."""
+    return JSONResponse(
+        content=json_safe(
+            {
+                "display_currency": display,
+                "data": [dict(row) for row in rows],
+            }
+        )
+    )
+
+
+# -------------------------
 # Public endpoints
 # -------------------------
 
 @app.get("/public/overview")
-async def get_overview():
+async def get_overview(currency: Optional[str] = None):
+    display = resolve_display_currency(currency)
     conn = await get_conn()
     try:
         rows = await conn.fetch(
-            "SELECT * FROM public.v_portfolio_overview_base ORDER BY portfolio_name"
+            "SELECT * FROM public.get_overview_display($1) ORDER BY portfolio_name",
+            display,
         )
-        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+        return display_list_response(display, rows)
     finally:
         await conn.close()
 
 
 @app.get("/public/allocation")
-async def get_allocation(portfolio: str, group_by: str = "asset_class"):
-    view_map = {
-        "asset_class": "v_allocation_asset_class_base",
-        "broker": "v_allocation_broker_base",
-        "currency": "v_allocation_currency_base",
-    }
-    view = view_map.get(group_by.lower())
-    if not view:
+async def get_allocation(
+    portfolio: str,
+    group_by: str = "asset_class",
+    currency: Optional[str] = None,
+):
+    display = resolve_display_currency(currency)
+    if group_by.lower() not in ("asset_class", "broker", "currency"):
         return JSONResponse(content={"error": "Invalid group_by"}, status_code=400)
 
     conn = await get_conn()
     try:
+        # get_allocation_display pivots gross_trade_volume_base at today's rate
+        # and passes allocation_percent through UNCHANGED (scale-invariant).
         rows = await conn.fetch(
-            f"""
+            """
             SELECT *
-            FROM public.{view}
-            WHERE portfolio_name = $1
+            FROM public.get_allocation_display($1, $2)
+            WHERE portfolio_name = $3
             ORDER BY allocation_percent DESC
             """,
+            display,
+            group_by.lower(),
             portfolio,
         )
-        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+        return display_list_response(display, rows)
     finally:
         await conn.close()
 
 
 @app.get("/public/trades")
-async def get_trades(portfolio: Optional[str] = None, limit: int = 100):
+async def get_trades(
+    portfolio: Optional[str] = None,
+    limit: int = 100,
+    currency: Optional[str] = None,
+):
+    display = resolve_display_currency(currency)
     conn = await get_conn()
     try:
+        # get_trades_display converts gross_value_base / fee_base at each
+        # trade's OWN date (per-row rate). quantity / price / gross_value_native
+        # stay native.
         if portfolio:
             rows = await conn.fetch(
                 """
-                SELECT portfolio_name, base_currency, broker, symbol, asset_class,
-                       instrument_type, side, quantity, price, currency,
-                       gross_value_native, gross_value_base, fee_base, trade_timestamp
-                FROM public.v_recent_trades_base
-                WHERE portfolio_name = $1
+                SELECT *
+                FROM public.get_trades_display($1)
+                WHERE portfolio_name = $2
                 ORDER BY trade_timestamp DESC
-                LIMIT $2
+                LIMIT $3
                 """,
+                display,
                 portfolio,
                 limit,
             )
         else:
             rows = await conn.fetch(
                 """
-                SELECT portfolio_name, base_currency, broker, symbol, asset_class,
-                       instrument_type, side, quantity, price, currency,
-                       gross_value_native, gross_value_base, fee_base, trade_timestamp
-                FROM public.v_recent_trades_base
+                SELECT *
+                FROM public.get_trades_display($1)
                 ORDER BY trade_timestamp DESC
-                LIMIT $1
+                LIMIT $2
                 """,
+                display,
                 limit,
             )
-        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+        return display_list_response(display, rows)
     finally:
         await conn.close()
 
@@ -440,28 +498,36 @@ async def get_broker_accounts():
         await conn.close()
 
 @app.get("/public/positions")
-async def get_positions(portfolio: Optional[str] = None):
+async def get_positions(
+    portfolio: Optional[str] = None,
+    currency: Optional[str] = None,
+):
+    display = resolve_display_currency(currency)
     conn = await get_conn()
     try:
+        # LIVE snapshot -> today's rate. quantity / avg_cost / market_price
+        # stay native; only market_value / open_pnl convert.
         if portfolio:
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_positions_public_base
-                WHERE portfolio_name = $1
-                ORDER BY market_value_base DESC NULLS LAST
+                FROM public.get_positions_display($1)
+                WHERE portfolio_name = $2
+                ORDER BY market_value_display DESC NULLS LAST
                 """,
+                display,
                 portfolio,
             )
         else:
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_positions_public_base
-                ORDER BY portfolio_name, market_value_base DESC NULLS LAST
-                """
+                FROM public.get_positions_display($1)
+                ORDER BY portfolio_name, market_value_display DESC NULLS LAST
+                """,
+                display,
             )
-        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+        return display_list_response(display, rows)
     finally:
         await conn.close()
 
@@ -469,18 +535,23 @@ async def get_positions(portfolio: Optional[str] = None):
 async def get_public_closed_positions(
     portfolio: Optional[str] = None,
     limit: int = 200,
+    currency: Optional[str] = None,
 ):
+    display = resolve_display_currency(currency)
     conn = await get_conn()
     try:
+        # closed_pnl_base converts at each symbol's close date (last_event_time);
+        # closed_pnl_native stays native.
         if portfolio:
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_closed_positions_public
-                WHERE portfolio_name = $1
-                ORDER BY closed_pnl_base DESC NULLS LAST
-                LIMIT $2
+                FROM public.get_closed_positions_display($1)
+                WHERE portfolio_name = $2
+                ORDER BY closed_pnl_display DESC NULLS LAST
+                LIMIT $3
                 """,
+                display,
                 portfolio,
                 limit,
             )
@@ -488,14 +559,15 @@ async def get_public_closed_positions(
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_closed_positions_public
-                ORDER BY portfolio_name, closed_pnl_base DESC NULLS LAST
-                LIMIT $1
+                FROM public.get_closed_positions_display($1)
+                ORDER BY portfolio_name, closed_pnl_display DESC NULLS LAST
+                LIMIT $2
                 """,
+                display,
                 limit,
             )
 
-        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+        return display_list_response(display, rows)
 
     finally:
         await conn.close()
@@ -537,54 +609,145 @@ async def get_public_closed_position_details(
 
 
 @app.get("/public/nav")
-async def get_nav(portfolio: Optional[str] = None):
+async def get_nav(
+    portfolio: Optional[str] = None,
+    currency: Optional[str] = None,
+):
+    display = resolve_display_currency(currency)
     conn = await get_conn()
     try:
+        # LATEST NAV per broker -> today's rate (get_nav_display). For the
+        # historical curve use /public/nav-series (per-snapshot_date rate).
         if portfolio:
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_nav_latest_public
-                WHERE portfolio_name = $1
+                FROM public.get_nav_display($1)
+                WHERE portfolio_name = $2
                 ORDER BY broker
                 """,
+                display,
                 portfolio,
             )
         else:
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_nav_latest_public
+                FROM public.get_nav_display($1)
                 ORDER BY portfolio_name, broker
-                """
+                """,
+                display,
             )
-        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+        return display_list_response(display, rows)
+    finally:
+        await conn.close()
+
+
+@app.get("/public/nav-series")
+async def get_nav_series(
+    portfolio: Optional[str] = None,
+    currency: Optional[str] = None,
+):
+    display = resolve_display_currency(currency)
+    conn = await get_conn()
+    try:
+        # HISTORICAL NAV curve. get_nav_series_display converts EACH snapshot
+        # at ITS OWN snapshot_date (Variante-B-safe): a NAV curve in EUR/USD
+        # reflects real FX movement instead of one uniform rescale.
+        if portfolio:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.get_nav_series_display($1)
+                WHERE portfolio_name = $2
+                ORDER BY broker, snapshot_date
+                """,
+                display,
+                portfolio,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.get_nav_series_display($1)
+                ORDER BY portfolio_name, broker, snapshot_date
+                """,
+                display,
+            )
+        return display_list_response(display, rows)
     finally:
         await conn.close()
 
 @app.get("/public/portfolio-summary")
-async def get_portfolio_summary(portfolio: Optional[str] = None):
+async def get_portfolio_summary(
+    portfolio: Optional[str] = None,
+    currency: Optional[str] = None,
+):
+    display = resolve_display_currency(currency)
     conn = await get_conn()
     try:
+        # LIVE aggregate NAV -> today's rate. All money columns convert.
         if portfolio:
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_public_portfolio_summary
-                WHERE portfolio_name = $1
+                FROM public.get_portfolio_summary_display($1)
+                WHERE portfolio_name = $2
                 """,
+                display,
                 portfolio,
             )
         else:
             rows = await conn.fetch(
                 """
                 SELECT *
-                FROM public.v_public_portfolio_summary
+                FROM public.get_portfolio_summary_display($1)
                 ORDER BY portfolio_name
-                """
+                """,
+                display,
             )
 
-        return JSONResponse(content=json_safe([dict(row) for row in rows]))
+        return display_list_response(display, rows)
+    finally:
+        await conn.close()
+
+
+@app.get("/public/cashflows")
+async def get_public_cashflows(
+    portfolio: Optional[str] = None,
+    limit: int = 200,
+    currency: Optional[str] = None,
+):
+    display = resolve_display_currency(currency)
+    conn = await get_conn()
+    try:
+        # amount_base converts at each cashflow's OWN date (cashflow_date);
+        # amount_native stays native.
+        if portfolio:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.get_cashflows_display($1)
+                WHERE portfolio_name = $2
+                ORDER BY cashflow_date DESC, created_at DESC
+                LIMIT $3
+                """,
+                display,
+                portfolio,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.get_cashflows_display($1)
+                ORDER BY portfolio_name, cashflow_date DESC, created_at DESC
+                LIMIT $2
+                """,
+                display,
+                limit,
+            )
+        return display_list_response(display, rows)
     finally:
         await conn.close()
 
@@ -627,28 +790,54 @@ async def get_public_dashboard(
     trade_limit: int = 25,
     closed_limit: int = 100,
     closed_detail_limit: int = 200,
+    currency: Optional[str] = None,
 ):
+    display = resolve_display_currency(currency)
     conn = await get_conn()
     try:
+        # Value blocks below go through the get_*_display() wrappers so they
+        # honour the toggle. TWO blocks deliberately stay CHF (documented at
+        # their call sites): position-allocation (percent-based, no display
+        # wrapper) and closed_position_details (no display wrapper). Performance
+        # stays CHF and is tagged currency:"CHF".
         summary_rows = await conn.fetch(
             """
             SELECT *
-            FROM public.v_public_portfolio_summary
-            WHERE portfolio_name = $1
+            FROM public.get_portfolio_summary_display($1)
+            WHERE portfolio_name = $2
             """,
+            display,
             portfolio,
         )
 
+        # Latest NAV per broker (today's rate).
         nav_rows = await conn.fetch(
             """
-            SELECT DISTINCT ON (broker) *
-            FROM public.v_portfolio_nav_snapshots_base
-            WHERE portfolio_name = $1
-            ORDER BY broker, snapshot_date DESC, created_at DESC
+            SELECT *
+            FROM public.get_nav_display($1)
+            WHERE portfolio_name = $2
+            ORDER BY broker
             """,
+            display,
             portfolio,
         )
 
+        # Historical NAV curve, each point at its own snapshot_date rate
+        # (Variante-B-safe). New block; consumers can ignore it if unused.
+        nav_series_rows = await conn.fetch(
+            """
+            SELECT *
+            FROM public.get_nav_series_display($1)
+            WHERE portfolio_name = $2
+            ORDER BY broker, snapshot_date
+            """,
+            display,
+            portfolio,
+        )
+
+        # NOTE: position-allocation stays CHF. allocation_percent is
+        # scale-invariant; the absolute market_value_base remains in CHF (no
+        # display wrapper built for v_position_allocation_*). See deferred list.
         allocation_asset_class_rows = await conn.fetch(
             """
             SELECT *
@@ -682,21 +871,23 @@ async def get_public_dashboard(
         position_rows = await conn.fetch(
             """
             SELECT *
-            FROM public.v_positions_public_base
-            WHERE portfolio_name = $1
-            ORDER BY ABS(market_value_base) DESC NULLS LAST
+            FROM public.get_positions_display($1)
+            WHERE portfolio_name = $2
+            ORDER BY ABS(market_value_display) DESC NULLS LAST
             """,
+            display,
             portfolio,
         )
 
         trade_rows = await conn.fetch(
             """
             SELECT *
-            FROM public.v_recent_trades_base
-            WHERE portfolio_name = $1
+            FROM public.get_trades_display($1)
+            WHERE portfolio_name = $2
             ORDER BY trade_timestamp DESC
-            LIMIT $2
+            LIMIT $3
             """,
+            display,
             portfolio,
             trade_limit,
         )
@@ -704,15 +895,18 @@ async def get_public_dashboard(
         closed_position_rows = await conn.fetch(
             """
             SELECT *
-            FROM public.v_closed_positions_public
-            WHERE portfolio_name = $1
-            ORDER BY closed_pnl_base DESC NULLS LAST
-            LIMIT $2
+            FROM public.get_closed_positions_display($1)
+            WHERE portfolio_name = $2
+            ORDER BY closed_pnl_display DESC NULLS LAST
+            LIMIT $3
             """,
+            display,
             portfolio,
             closed_limit,
         )
 
+        # NOTE: closed_position_details stays CHF/native (no display wrapper
+        # for v_closed_positions_detail_public). See deferred list.
         closed_position_detail_rows = await conn.fetch(
             """
             SELECT *
@@ -790,13 +984,23 @@ async def get_public_dashboard(
             portfolio,
         )
 
+        # Performance stays canonical CHF (TWR/MWR are currency-independent by
+        # design). Tag it explicitly so the frontend labels it "Performance in
+        # CHF" regardless of the active display currency.
+        performance = None
+        if performance_row:
+            performance = dict(performance_row)
+            performance["currency"] = "CHF"
+
         return JSONResponse(
             content=json_safe(
                 {
                     "portfolio": portfolio,
+                    "display_currency": display,
                     "summary": dict(summary_rows[0]) if summary_rows else None,
                     "nav_by_broker": [dict(row) for row in nav_rows],
-                    "performance": dict(performance_row) if performance_row else None,
+                    "nav_series": [dict(row) for row in nav_series_rows],
+                    "performance": performance,
                     "allocation": {
                         "asset_class": [dict(row) for row in allocation_asset_class_rows],
                         "broker": [dict(row) for row in allocation_broker_rows],
