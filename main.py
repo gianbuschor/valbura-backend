@@ -10,6 +10,7 @@ import hashlib
 import xml.etree.ElementTree as ET
 import csv
 import io
+import math
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta, date
@@ -3967,6 +3968,314 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
         )
 
     except Exception as e:
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+
+    finally:
+        await conn.close()
+
+
+# -------------------------
+# Benchmark sync (Block 3)
+# -------------------------
+#
+# Multi-source EOD price fetch for the benchmark comparison. Prices are stored
+# NATIVE (USD for every current benchmark) in public.benchmark_prices; the
+# FX->base conversion and the 100-rebasing happen at READ time (migration 0006),
+# never here. Three keyed/keyless sources, each behind its own fetcher with a
+# UNIFIED return contract: list[(price_date: date, close: float, currency: str)].
+#
+# The /sync/benchmark endpoint isolates every (source, symbol) in its own
+# try/except so ONE bad source never aborts the others (no all-or-nothing); a
+# per-source summary is returned and logged to import_jobs (broker='benchmark')
+# for visibility in v_sync_status. 5xx is returned ONLY when every attempted
+# source failed.
+
+
+class BenchmarkSourceError(Exception):
+    """A single benchmark source/symbol failed to deliver usable data.
+
+    Raised by the fetchers (e.g. Twelve Data status='error', empty payload) so
+    the endpoint can record it as a per-source error and CONTINUE with the other
+    sources, instead of letting the whole run throw.
+    """
+
+
+async def fetch_fred_series(series_id: str, start_date: date, end_date: date):
+    """FRED CSV (keyless). Skips '.' gaps. -> list[(date, close, 'USD')]."""
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+    params = {
+        "id": series_id,
+        "cosd": start_date.isoformat(),  # cosd = observation start date
+        "coed": end_date.isoformat(),    # coed = observation end date
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        text = resp.text
+
+    out = []
+    reader = csv.reader(io.StringIO(text))
+    next(reader, None)  # header: observation_date,<SERIES_ID>
+    for row in reader:
+        if len(row) < 2:
+            continue
+        raw_date, raw_val = row[0].strip(), row[1].strip()
+        # FRED marks missing observations (weekends/holidays) with '.'.
+        if not raw_date or raw_val in ("", "."):
+            continue
+        try:
+            d = date.fromisoformat(raw_date)
+            v = float(raw_val)
+        except ValueError:
+            continue
+        out.append((d, v, "USD"))
+    return out
+
+
+async def fetch_coingecko_series(coin_id: str, start_date: date, end_date: date):
+    """CoinGecko market_chart/range (keyless, vs_currency=usd).
+
+    The range endpoint returns intraday granularity for short windows; we reduce
+    to ONE close per UTC day (the last observation of each day). -> list[(date, close, 'USD')].
+    """
+    frm = int(datetime(start_date.year, start_date.month, start_date.day,
+                       tzinfo=timezone.utc).timestamp())
+    # +1 day so the whole end_date is inside the [from, to] window.
+    to = int((datetime(end_date.year, end_date.month, end_date.day,
+                       tzinfo=timezone.utc) + timedelta(days=1)).timestamp())
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart/range"
+    params = {"vs_currency": "usd", "from": frm, "to": to}
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    prices = (data or {}).get("prices") or []
+    # CoinGecko returns points in chronological order; overwriting per day keeps
+    # the LAST (latest) price of that day as the day's close.
+    by_day = {}
+    for point in prices:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        ts_ms, price = point[0], point[1]
+        d = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).date()
+        by_day[d] = price
+    return [(d, float(p), "USD") for d, p in sorted(by_day.items())]
+
+
+async def fetch_twelvedata_series(symbol: str, mic_code: Optional[str],
+                                  api_key: str, start_date: date, end_date: date):
+    """Twelve Data time_series (keyed). US-exchange pinned via mic_code (ARCX)
+    against ticker collisions (DBC/IGE). status='error' -> BenchmarkSourceError
+    (treated as a source failure, NOT thrown out of the endpoint).
+    -> list[(date, close, 'USD')].
+    """
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": "1day",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "outputsize": 5000,
+        "order": "ASC",
+        "apikey": api_key,
+    }
+    if mic_code:
+        params["mic_code"] = mic_code  # pin the US listing
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, params=params)
+        data = resp.json()
+
+    # Twelve Data signals problems in-body with status='error' (HTTP is often
+    # still 200). Missing key, bad symbol, rate limit all land here.
+    if isinstance(data, dict) and data.get("status") == "error":
+        raise BenchmarkSourceError(
+            f"twelvedata error for {symbol}: {data.get('message')} (code {data.get('code')})"
+        )
+    values = data.get("values") if isinstance(data, dict) else None
+    if not values:
+        raise BenchmarkSourceError(f"twelvedata returned no values for {symbol}")
+
+    out = []
+    for v in values:
+        raw_date = (v.get("datetime") or "").strip()
+        raw_close = v.get("close")
+        if not raw_date or raw_close in (None, ""):
+            continue
+        try:
+            d = date.fromisoformat(raw_date[:10])
+            c = float(raw_close)
+        except (ValueError, TypeError):
+            continue
+        out.append((d, c, "USD"))
+    return out
+
+
+@app.post("/sync/benchmark")
+async def sync_benchmark_prices(
+    backfill: bool = False,
+    since: Optional[str] = None,
+    x_admin_token: Optional[str] = Header(None),
+):
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    conn = await get_conn()
+    job_id = None
+
+    try:
+        today = datetime.now(timezone.utc).date()
+
+        # --- Determine the fetch window --------------------------------------
+        #   explicit ?since=YYYY-MM-DD  -> that date
+        #   ?backfill=true              -> MIN(NAV date) minus a few days, so the
+        #                                  0006 carry-forward lookback (last close
+        #                                  <= common start S) has headroom before
+        #                                  the first NAV date.
+        #   default (daily incremental) -> today - 5 (overlap covers weekends/
+        #                                  holidays + late-published closes; the
+        #                                  upsert makes re-fetching idempotent).
+        mode = "backfill" if backfill else "incremental"
+        if since:
+            try:
+                start_date = date.fromisoformat(since)
+                mode = "since"
+            except ValueError:
+                return JSONResponse(
+                    content={"error": f"Invalid 'since' date: {since!r} (expected YYYY-MM-DD)"},
+                    status_code=400,
+                )
+        elif backfill:
+            row = await conn.fetchrow(
+                "SELECT MIN(snapshot_date) AS d FROM public.portfolio_nav_snapshots"
+            )
+            min_nav = row["d"] if row else None
+            if min_nav is None:
+                min_nav = today - timedelta(days=30)
+            start_date = min_nav - timedelta(days=7)
+        else:
+            start_date = today - timedelta(days=5)
+
+        # --- Load the active benchmark catalog -------------------------------
+        benchmarks = await conn.fetch(
+            """
+            SELECT benchmark_key, source, source_symbol, native_currency, mic_code
+            FROM public.benchmarks
+            WHERE active = true
+            ORDER BY benchmark_key
+            """
+        )
+
+        job_id = await start_import_job(
+            conn, "benchmark", None,
+            {"mode": mode, "since": start_date.isoformat(),
+             "work_started_at": datetime.now(timezone.utc).isoformat()},
+        )
+
+        td_key = os.getenv("TWELVE_DATA_API_KEY")
+
+        results: dict = {}
+        total_rows = 0
+
+        # --- Per-source isolation: one bad source never aborts the others ----
+        for b in benchmarks:
+            key = b["benchmark_key"]
+            source = b["source"]
+            symbol = b["source_symbol"]
+            native_ccy = b["native_currency"] or "USD"
+            mic = b["mic_code"]
+
+            try:
+                if source == "fred":
+                    series = await fetch_fred_series(symbol, start_date, today)
+                elif source == "coingecko":
+                    series = await fetch_coingecko_series(symbol, start_date, today)
+                elif source == "twelvedata":
+                    if not td_key:
+                        # Graceful: no key -> skip THIS source, keep the rest.
+                        results[key] = {"status": "skipped", "reason": "no key", "rows": 0}
+                        continue
+                    series = await fetch_twelvedata_series(symbol, mic, td_key, start_date, today)
+                else:
+                    results[key] = {"status": "error", "error": f"unknown source '{source}'", "rows": 0}
+                    continue
+
+                # --- Validation guards + unified upsert ----------------------
+                inserted = 0
+                rejected = 0
+                for (pdate, close, ccy) in series:
+                    if close is None or not math.isfinite(close) or close <= 0:
+                        rejected += 1
+                        continue
+                    await conn.execute(
+                        """
+                        INSERT INTO public.benchmark_prices
+                            (benchmark_key, price_date, close, currency, source)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (benchmark_key, price_date)
+                        DO UPDATE SET
+                            close = EXCLUDED.close,
+                            currency = EXCLUDED.currency,
+                            source = EXCLUDED.source,
+                            created_at = now()
+                        """,
+                        key, pdate, close, ccy or native_ccy, source,
+                    )
+                    inserted += 1
+
+                total_rows += inserted
+                entry = {"status": "ok", "rows": inserted, "source": source}
+                if rejected:
+                    entry["rejected"] = rejected
+                results[key] = entry
+
+            except Exception as e:
+                # Per-source failure recorded; loop continues with next benchmark.
+                results[key] = {"status": "error", "error": str(e), "rows": 0, "source": source}
+
+        # --- Outcome: 5xx ONLY if every ATTEMPTED source failed --------------
+        attempted = {k: v for k, v in results.items() if v["status"] in ("ok", "error")}
+        ok_keys = [k for k, v in results.items() if v["status"] == "ok"]
+        all_failed = len(attempted) > 0 and len(ok_keys) == 0
+
+        summary_meta = {
+            "mode": mode,
+            "since": start_date.isoformat(),
+            "total_rows": total_rows,
+            "sources": results,
+        }
+
+        if job_id:
+            await finish_import_job(
+                conn, job_id,
+                status="failed" if all_failed else "success",
+                rows_seen=total_rows,
+                rows_inserted=total_rows,
+                error_message="all benchmark sources failed" if all_failed else None,
+                metadata=summary_meta,
+            )
+
+        return JSONResponse(
+            content={
+                "status": "failed" if all_failed else "success",
+                "mode": mode,
+                "since": start_date.isoformat(),
+                "total_rows": total_rows,
+                "sources": results,
+            },
+            status_code=500 if all_failed else 200,
+        )
+
+    except Exception as e:
+        # Endpoint-level failure (DB down, catalog query, etc.) — mark the job.
+        if job_id:
+            try:
+                await finish_import_job(conn, job_id, status="failed", error_message=str(e))
+            except Exception:
+                pass
         return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
 
     finally:
