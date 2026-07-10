@@ -4282,6 +4282,96 @@ async def sync_benchmark_prices(
         await conn.close()
 
 
+@app.get("/debug/benchmark/inspect")
+async def debug_benchmark_inspect(x_admin_token: Optional[str] = Header(None)):
+    """Read-only verification aid (admin-guarded).
+
+    (1) 'stored': per benchmark_key what actually landed in benchmark_prices —
+        row count, first/last price_date, and the latest close/currency. Lets us
+        eyeball the magnitude (e.g. DBC ~20-25 USD, GUNR ~35-45 USD) to prove the
+        US ETF was fetched, not a colliding foreign stock.
+    (2) 'twelvedata_meta': a LIVE time_series meta lookup for the pinned
+        twelvedata symbols. Twelve Data echoes symbol/exchange/mic_code/currency
+        in the response 'meta' block — the authoritative cross-check that the
+        mic_code=ARCX pin resolved to the US listing (currency USD, not PLN/GBp).
+        Runs on Railway where TWELVE_DATA_API_KEY is set; the key never leaves
+        the server. This is a temporary inspection endpoint (superseded by the
+        0006 /public/benchmark read model).
+    """
+    try:
+        require_admin_token(x_admin_token)
+    except PermissionError:
+        return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT bp.benchmark_key,
+                   b.source,
+                   b.source_symbol,
+                   b.mic_code,
+                   count(*)               AS rows,
+                   min(bp.price_date)     AS first_date,
+                   max(bp.price_date)     AS last_date,
+                   (array_agg(bp.close    ORDER BY bp.price_date DESC))[1] AS latest_close,
+                   (array_agg(bp.currency ORDER BY bp.price_date DESC))[1] AS latest_currency
+            FROM public.benchmark_prices bp
+            JOIN public.benchmarks b ON b.benchmark_key = bp.benchmark_key
+            GROUP BY bp.benchmark_key, b.source, b.source_symbol, b.mic_code
+            ORDER BY bp.benchmark_key
+            """
+        )
+        stored = [dict(r) for r in rows]
+
+        td_key = os.getenv("TWELVE_DATA_API_KEY")
+        td_meta: dict = {}
+        if not td_key:
+            td_meta = {"note": "no TWELVE_DATA_API_KEY set"}
+        else:
+            td_symbols = await conn.fetch(
+                """
+                SELECT benchmark_key, source_symbol, mic_code
+                FROM public.benchmarks
+                WHERE source = 'twelvedata' AND active = true
+                ORDER BY benchmark_key
+                """
+            )
+            async with httpx.AsyncClient(timeout=30) as client:
+                for s in td_symbols:
+                    params = {
+                        "symbol": s["source_symbol"],
+                        "interval": "1day",
+                        "outputsize": 1,
+                        "apikey": td_key,
+                    }
+                    if s["mic_code"]:
+                        params["mic_code"] = s["mic_code"]
+                    try:
+                        resp = await client.get(
+                            "https://api.twelvedata.com/time_series", params=params
+                        )
+                        data = resp.json()
+                        meta = data.get("meta") if isinstance(data, dict) else None
+                        latest_close = None
+                        if isinstance(data, dict) and data.get("values"):
+                            latest_close = data["values"][0].get("close")
+                        td_meta[s["benchmark_key"]] = {
+                            "status": data.get("status") if isinstance(data, dict) else None,
+                            "meta": meta,  # symbol/exchange/mic_code/currency/type
+                            "latest_close": latest_close,
+                        }
+                    except Exception as e:
+                        td_meta[s["benchmark_key"]] = {"error": str(e)}
+
+        return JSONResponse(content=json_safe({"stored": stored, "twelvedata_meta": td_meta}))
+
+    except Exception as e:
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+    finally:
+        await conn.close()
+
+
 # -------------------------
 # MT5 ingest endpoint
 # -------------------------
