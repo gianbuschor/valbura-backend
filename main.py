@@ -4032,11 +4032,28 @@ async def fetch_fred_series(series_id: str, start_date: date, end_date: date):
     return out
 
 
-async def fetch_coingecko_series(coin_id: str, start_date: date, end_date: date):
-    """CoinGecko market_chart/range (keyless, vs_currency=usd).
+# CoinGecko 429 backoff. Kept SHORT on purpose: a long in-request sleep would
+# risk Railway's ~60s proxy timeout killing the WHOLE /sync/benchmark request
+# (see the STALE_JOB_MINUTES note re "Railway proxy 60s timeout"). One retry at
+# ~20s heals a transient throttle without endangering the other five sources.
+# The real fix for the (rare, 1-call/day) rate limit is the free Demo key below.
+COINGECKO_429_BACKOFF_SECONDS = 20
 
-    The range endpoint returns intraday granularity for short windows; we reduce
-    to ONE close per UTC day (the last observation of each day). -> list[(date, close, 'USD')].
+
+async def fetch_coingecko_series(coin_id: str, start_date: date, end_date: date):
+    """CoinGecko market_chart/range (vs_currency=usd). ONE HTTP call per run.
+
+    Reduces intraday points to ONE close per UTC day (last observation of each
+    day). -> list[(date, close, 'USD')].
+
+    Auth: keyless by default. If COINGECKO_API_KEY is set (free Demo plan,
+    ~30 calls/min vs the tighter keyless limit), it is sent as the
+    'x-cg-demo-api-key' header — same base URL. Keyless stays the fallback until
+    the user registers a key; the code picks it up automatically once present.
+
+    Rate limit: on HTTP 429 we back off once (~20s, proxy-safe) and retry; a
+    second 429 raises BenchmarkSourceError so the endpoint records it as a
+    per-source failure (graceful) instead of aborting the run.
     """
     frm = int(datetime(start_date.year, start_date.month, start_date.day,
                        tzinfo=timezone.utc).timestamp())
@@ -4045,10 +4062,28 @@ async def fetch_coingecko_series(coin_id: str, start_date: date, end_date: date)
                        tzinfo=timezone.utc) + timedelta(days=1)).timestamp())
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart/range"
     params = {"vs_currency": "usd", "from": frm, "to": to}
+
+    # Optional free Demo key -> higher rate limit. Absent => keyless (fallback).
+    headers = {}
+    cg_key = os.getenv("COINGECKO_API_KEY")
+    if cg_key:
+        headers["x-cg-demo-api-key"] = cg_key
+
+    data = None
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
+        for attempt in range(2):  # initial try + one backed-off retry
+            resp = await client.get(url, params=params, headers=headers)
+            if resp.status_code == 429:
+                if attempt == 0:
+                    await asyncio.sleep(COINGECKO_429_BACKOFF_SECONDS)
+                    continue
+                raise BenchmarkSourceError(
+                    f"coingecko 429 rate-limited (after {COINGECKO_429_BACKOFF_SECONDS}s "
+                    f"backoff + retry) for {coin_id}"
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            break
 
     prices = (data or {}).get("prices") or []
     # CoinGecko returns points in chronological order; overwriting per day keeps
@@ -4236,35 +4271,80 @@ async def sync_benchmark_prices(
                 # Per-source failure recorded; loop continues with next benchmark.
                 results[key] = {"status": "error", "error": str(e), "rows": 0, "source": source}
 
-        # --- Outcome: 5xx ONLY if every ATTEMPTED source failed --------------
+        # --- Outcome -------------------------------------------------------
+        #   failed (500)             : every ATTEMPTED source failed.
+        #   success_with_warnings    : at least one source ok, but >=1 source
+        #                              errored or was skipped (e.g. a CoinGecko
+        #                              429 leaving a BTC gap). This must NOT be
+        #                              silently reported as plain "success" —
+        #                              the whole point is that the partial gap
+        #                              is visible in v_sync_status.status.
+        #   success (200)            : all sources ok, nothing skipped/errored.
+        #
+        # SAFE TO INTRODUCE 'success_with_warnings' — verified against every
+        # existing `status = 'success'` filter in the codebase (schema.sql
+        # latest_sync CTE; main.py portfolio-summary last_success / sync_errors):
+        # ALL of them are scoped by `portfolio_name = <a real portfolio>` or
+        # GROUP BY portfolio_name. Benchmark jobs are logged with
+        # broker='benchmark' and portfolio_name=NULL, so NONE of those filters
+        # ever match a benchmark row. => a benchmark run flagged
+        # 'success_with_warnings' cannot be accidentally excluded by, nor can it
+        # pollute, any portfolio's success/last-sync accounting. Do not "fix"
+        # this by forcing it back to 'success': that would re-hide the gap.
         attempted = {k: v for k, v in results.items() if v["status"] in ("ok", "error")}
         ok_keys = [k for k, v in results.items() if v["status"] == "ok"]
         all_failed = len(attempted) > 0 and len(ok_keys) == 0
+
+        # warnings = every source that did NOT deliver ok (error or skipped),
+        # with its reason — the human-readable "why is BTC missing" trail.
+        warnings = [
+            {"benchmark_key": k,
+             "status": v["status"],
+             "reason": v.get("error") or v.get("reason")}
+            for k, v in results.items()
+            if v["status"] in ("error", "skipped")
+        ]
+
+        if all_failed:
+            job_status = "failed"
+            err_msg = "all benchmark sources failed"
+        elif warnings:
+            job_status = "success_with_warnings"
+            # Compact, secret-free summary (source keys + statuses only) so the
+            # partial failure is legible directly in v_sync_status.error_message.
+            err_msg = "partial: " + ", ".join(
+                f"{w['benchmark_key']}={w['status']}" for w in warnings
+            )
+        else:
+            job_status = "success"
+            err_msg = None
 
         summary_meta = {
             "mode": mode,
             "since": start_date.isoformat(),
             "total_rows": total_rows,
             "sources": results,
+            "warnings": warnings,
         }
 
         if job_id:
             await finish_import_job(
                 conn, job_id,
-                status="failed" if all_failed else "success",
+                status=job_status,
                 rows_seen=total_rows,
                 rows_inserted=total_rows,
-                error_message="all benchmark sources failed" if all_failed else None,
+                error_message=err_msg,
                 metadata=summary_meta,
             )
 
         return JSONResponse(
             content={
-                "status": "failed" if all_failed else "success",
+                "status": job_status,
                 "mode": mode,
                 "since": start_date.isoformat(),
                 "total_rows": total_rows,
                 "sources": results,
+                "warnings": warnings,
             },
             status_code=500 if all_failed else 200,
         )
