@@ -3803,9 +3803,15 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
         return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
 
     conn = await get_conn()
+    job_id = None
 
     try:
         today = datetime.now(timezone.utc).date()
+        # Log this run as an import_jobs row (broker='fx', portfolio_name=NULL)
+        # so the plausibility guard's outcome is visible in v_sync_status.
+        # portfolio_name=NULL keeps it out of every per-portfolio
+        # status='success' filter (schema.sql latest_sync; main.py summary).
+        job_id = await start_import_job(conn, "fx", None, {"date": today.isoformat()})
 
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get("https://open.er-api.com/v6/latest/USD")
@@ -3924,6 +3930,55 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
                     f"usd_chf={usd_chf} are not at parity (expected ~{usd_t/usd_chf:.4f})"
                 )
 
+        # --- Plausibility guard (write-and-flag, never reject) --------------
+        #   A fiat SOURCE rate that jumps > BAND vs. the last known value is
+        #   almost certainly bad (decimal shift, wrong-currency slot, a stray
+        #   test value) — real USD majors move ~1-2%/day; >5% is a decade-scale
+        #   event. We do NOT reject: rejecting + carry-forward could FREEZE a
+        #   genuine sustained move (on day 2 the new level still looks "off" vs
+        #   the frozen old value, so it would be rejected forever). Instead we
+        #   WRITE the value and FLAG it (success_with_warnings) — nothing
+        #   freezes and the anomaly stays visible for a human to judge.
+        #   SELF-CONFIRMATION: because we always write, the stored "last known"
+        #   value equals the last raw API reading, so a real sustained move is
+        #   flagged ONCE (the jump day) and then silently accepted from the
+        #   next day on (day 2: new vs new = ~0%).
+        #   SCOPE: only the 5 USD->fiat source rates. Stablecoins (USDT/USDC)
+        #   are excluded — they are ~1 by definition and the anti-bug check
+        #   above already covers them; a movement guard is meaningless for them.
+        #   The derived CHF->X crosses are NOT guarded separately: the guard
+        #   sits on the SOURCE usd_chf, so a usd_chf outlier flags once
+        #   (USD/CHF), not five times across its crosses.
+        FX_GUARD_BAND = 0.05  # 5% day-over-day; see distribution: never trips on real fiat
+        fx_warnings = []
+        for _ccy, _new in (("CHF", usd_chf), ("EUR", usd_eur), ("GBP", usd_gbp),
+                           ("JPY", usd_jpy), ("CNY", usd_cny)):
+            if _new is None:
+                continue
+            # Baseline = last stored USD->ccy strictly BEFORE today, so a same-day
+            # re-run compares against yesterday (stable), not its own fresh write.
+            _prev = await conn.fetchval(
+                """
+                SELECT rate
+                FROM public.fx_rates
+                WHERE from_currency = 'USD' AND to_currency = $1
+                  AND rate_date < $2
+                ORDER BY rate_date DESC
+                LIMIT 1
+                """,
+                _ccy, today,
+            )
+            if _prev is None or float(_prev) == 0.0:
+                continue  # no baseline yet (first run for this pair) -> nothing to compare
+            _pct = (float(_new) / float(_prev) - 1.0) * 100.0
+            if abs(_pct) > FX_GUARD_BAND * 100.0:
+                fx_warnings.append({
+                    "pair": f"USD/{_ccy}",
+                    "last_known": round(float(_prev), 6),
+                    "written": round(float(_new), 6),
+                    "pct_change": round(_pct, 2),
+                })
+
         for from_currency, to_currency, rate, source in rows:
             await conn.execute(
                 """
@@ -3944,14 +3999,47 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
                 source,
             )
 
+        # --- Outcome: flag outliers, never fail the job on them ------------
+        #   Same contract as the benchmark sync: HTTP 200 for both 'success'
+        #   and 'success_with_warnings'; the flag lives in status + a compact,
+        #   secret-free error_message + metadata.warnings, visible in
+        #   v_sync_status without any per-portfolio filter matching (NULL name).
+        if fx_warnings:
+            job_status = "success_with_warnings"
+            err_msg = "fx outlier(s): " + ", ".join(
+                f"{w['pair']} {w['pct_change']:+.2f}% ({w['last_known']}->{w['written']})"
+                for w in fx_warnings
+            )
+        else:
+            job_status = "success"
+            err_msg = None
+
+        if job_id:
+            await finish_import_job(
+                conn, job_id,
+                status=job_status,
+                rows_seen=len(rows),
+                rows_inserted=len(rows),
+                error_message=err_msg,
+                metadata={
+                    "date": today.isoformat(),
+                    "usd_chf": usd_chf,
+                    "usd_eur": usd_eur,
+                    "usd_gbp": usd_gbp,
+                    "rows_upserted": len(rows),
+                    "warnings": fx_warnings,
+                },
+            )
+
         return JSONResponse(
             content={
-                "status": "success",
+                "status": job_status,
                 "date": today.isoformat(),
                 "usd_chf": usd_chf,
                 "usd_eur": usd_eur,
                 "usd_gbp": usd_gbp,
                 "rows_upserted": len(rows),
+                "warnings": fx_warnings,
                 # Echo the exact rows upserted (read-only, no secrets) so the
                 # stablecoin->fiat conversion can be verified without direct DB
                 # access: USD/USDT/USDC -> CHF must all equal the real usd_chf.
@@ -3968,6 +4056,13 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
         )
 
     except Exception as e:
+        # Endpoint-level failure (API down, DB error, anti-bug raise, ...) —
+        # mark the job so the failure is legible in v_sync_status.
+        if job_id:
+            try:
+                await finish_import_job(conn, job_id, status="failed", error_message=str(e))
+            except Exception:
+                pass
         return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
 
     finally:
