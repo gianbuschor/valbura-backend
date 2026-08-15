@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi import FastAPI, Request, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -790,6 +790,96 @@ async def get_public_benchmark(portfolio: str):
                         "series": [dict(r) for r in series],
                         "summary": [dict(r) for r in summary],
                     },
+                }
+            )
+        )
+    finally:
+        await conn.close()
+
+
+@app.get("/public/risk")
+async def get_public_risk(
+    portfolio: str,
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
+):
+    """Risk metrics for ONE portfolio (performance family -> base-currency based,
+    NO ?currency=: the ratios are dimensionless and the rate metrics are in the
+    portfolio's base currency, echoed as base_currency).
+
+    Thin pass-through over the 0007 read model:
+        get_portfolio_risk_metrics(portfolio, from, to) -> data.{...metrics...}
+
+    Window: ?from=YYYY-MM-DD & ?to=YYYY-MM-DD are optional; omit both for
+    inception..latest ("since inception"). Rolling windows are just ?from=<date>.
+
+    Sufficiency is honest, not hidden: < 20 trading days -> every metric is
+    null with status "insufficient_data" and a real data_points count; 20-39
+    "indicative", 40+ "robust". data_points/status/confidence are always present.
+
+    Errors:
+        - unknown portfolio      -> 404 (explicit) + valid_portfolios
+        - invalid from/to date   -> 400 with a clear message
+    """
+    # Parse the optional window bounds up-front so a bad date is a clean 400.
+    def _parse(raw: Optional[str], label: str):
+        if raw is None or raw.strip() == "":
+            return None
+        try:
+            return date.fromisoformat(raw.strip())
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid '{label}' date: {raw!r} (expected YYYY-MM-DD).",
+            )
+
+    p_from = _parse(date_from, "from")
+    p_to = _parse(date_to, "to")
+    if p_from is not None and p_to is not None and p_from > p_to:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'from' ({p_from}) must not be after 'to' ({p_to}).",
+        )
+
+    conn = await get_conn()
+    try:
+        # Existence check FIRST (an unknown name yields the same empty output as
+        # a valid-but-dataless portfolio) + grab base_currency for the envelope.
+        base_currency = await conn.fetchval(
+            "SELECT base_currency FROM public.portfolios WHERE name = $1",
+            portfolio,
+        )
+        if base_currency is None:
+            valid = await conn.fetch(
+                "SELECT name FROM public.portfolios ORDER BY name"
+            )
+            return JSONResponse(
+                content={
+                    "error": f"Portfolio '{portfolio}' not found.",
+                    "valid_portfolios": [r["name"] for r in valid],
+                },
+                status_code=404,
+            )
+
+        # rf and min_obs stay at the function defaults (0% / 20 trading days);
+        # not exposed as query params in v1.
+        row = await conn.fetchrow(
+            "SELECT * FROM public.get_portfolio_risk_metrics($1, $2, $3)",
+            portfolio, p_from, p_to,
+        )
+
+        data = dict(row) if row else {}
+        # base_currency is echoed at the envelope level; drop the duplicates
+        # the function also returns so the payload has a single source of truth.
+        data.pop("portfolio_name", None)
+        data.pop("base_currency", None)
+
+        return JSONResponse(
+            content=json_safe(
+                {
+                    "portfolio": portfolio,
+                    "base_currency": base_currency,
+                    "data": data,
                 }
             )
         )
