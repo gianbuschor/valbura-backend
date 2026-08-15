@@ -874,6 +874,18 @@ async def get_public_risk(
         data.pop("portfolio_name", None)
         data.pop("base_currency", None)
 
+        # Beta / correlation / R^2 per mapped benchmark (Block 4b, 0008), SAME
+        # window as the core metrics. Multi-row -> a list, ordered by the
+        # function (sort_order, benchmark_key). Empty list when nothing is mapped
+        # or there is no price overlap. Base-currency beta (both legs in
+        # base_currency); dimensionless -> no annualization. < 20 common trading
+        # days -> figures null with status "insufficient_data".
+        beta_rows = await conn.fetch(
+            "SELECT * FROM public.get_portfolio_beta($1, $2, $3)",
+            portfolio, p_from, p_to,
+        )
+        data["betas"] = [dict(b) for b in beta_rows]
+
         return JSONResponse(
             content=json_safe(
                 {
