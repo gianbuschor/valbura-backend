@@ -713,6 +713,90 @@ async def get_portfolio_summary(
         await conn.close()
 
 
+@app.get("/public/benchmark")
+async def get_public_benchmark(portfolio: str):
+    """Benchmark comparison for ONE portfolio.
+
+    Performance family -> ALWAYS CHF-based, NO ?currency=: both curves are
+    rebased to 100, i.e. unitless/relative (we never expose absolute close_base),
+    so a display currency would be meaningless (same rule as the TWR/MWR path).
+
+    Returns the time series AND the scalar summary in ONE envelope because the
+    frontend renders them together (chart + its excess-return legend). Thin
+    pass-through over the 0006 read model:
+        get_benchmark_comparison(portfolio) -> data.series
+        get_benchmark_summary(portfolio)    -> data.summary
+
+    series rows repeat portfolio_twr_index across benchmarks for a given date
+    (the portfolio curve is benchmark-independent); the frontend groups by
+    benchmark_key and reads the portfolio curve from any one group.
+
+    The envelope echoes the portfolio's base_currency (Day Trading = USD,
+    Global/Alternatives = CHF) so the frontend knows the currency the benchmark
+    KENNZAHLEN are computed in and never mislabels e.g. a USD figure as CHF.
+
+    Errors:
+        - unknown portfolio             -> 404 (explicit, never an empty 200)
+        - valid portfolio, no mapping   -> 200 with empty series/summary
+    """
+    conn = await get_conn()
+    try:
+        # Existence check FIRST: an unknown name yields empty function output
+        # that is indistinguishable from a valid-but-unmapped portfolio, so we
+        # must disambiguate here to return a correct 404 (not a silent empty 200).
+        # We also grab base_currency here to echo it in the envelope.
+        base_currency = await conn.fetchval(
+            "SELECT base_currency FROM public.portfolios WHERE name = $1",
+            portfolio,
+        )
+        if base_currency is None:
+            valid = await conn.fetch(
+                "SELECT name FROM public.portfolios ORDER BY name"
+            )
+            return JSONResponse(
+                content={
+                    "error": f"Portfolio '{portfolio}' not found.",
+                    "valid_portfolios": [r["name"] for r in valid],
+                },
+                status_code=404,
+            )
+
+        series = await conn.fetch(
+            """
+            SELECT benchmark_key, display_name, sort_order,
+                   price_date, portfolio_twr_index, benchmark_index
+            FROM public.get_benchmark_comparison($1)
+            ORDER BY sort_order, benchmark_key, price_date
+            """,
+            portfolio,
+        )
+        summary = await conn.fetch(
+            """
+            SELECT benchmark_key, display_name, sort_order, as_of_date,
+                   portfolio_twr_percent, benchmark_return_percent,
+                   excess_return_percent
+            FROM public.get_benchmark_summary($1)
+            ORDER BY sort_order, benchmark_key
+            """,
+            portfolio,
+        )
+
+        return JSONResponse(
+            content=json_safe(
+                {
+                    "portfolio": portfolio,
+                    "base_currency": base_currency,
+                    "data": {
+                        "series": [dict(r) for r in series],
+                        "summary": [dict(r) for r in summary],
+                    },
+                }
+            )
+        )
+    finally:
+        await conn.close()
+
+
 @app.get("/public/cashflows")
 async def get_public_cashflows(
     portfolio: Optional[str] = None,
