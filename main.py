@@ -329,24 +329,25 @@ async def get_fx_rate(
 # Display-currency toggle (Block 2, step 4)
 # -------------------------
 
-# The SIX display currencies the toggle supports. CHF is the portfolio base
-# (fx_to_display => 1, byte-identical to the pre-toggle behaviour). The rest
-# pivot through the CHF base via the get_*_display() SQL wrappers (migration
-# 0003). This allow-list is the SINGLE source of truth for the API layer.
-ALLOWED_DISPLAY_CURRENCIES = ("CHF", "EUR", "USD", "GBP", "JPY", "CNY")
+# The SIX display currencies the toggle supports. USD is the portfolio base
+# (fx_to_display => 1, byte-identical to the un-toggled base value). The rest
+# pivot through the USD base via the get_*_display() SQL wrappers (migration
+# 0003, anchor flipped to USD in 0009). This allow-list is the SINGLE source of
+# truth for the API layer.
+ALLOWED_DISPLAY_CURRENCIES = ("USD", "EUR", "CHF", "GBP", "JPY", "CNY")
 
 
 def resolve_display_currency(currency: Optional[str]) -> str:
     """Validate & normalise the ?currency= query param.
 
-    - None / empty            -> default 'CHF' (base; conversion factor 1).
+    - None / empty            -> default 'USD' (base; conversion factor 1).
     - case-insensitive        -> returned upper-cased.
-    - anything else           -> HTTP 400 (NO silent fallback to CHF).
+    - anything else           -> HTTP 400 (NO silent fallback).
 
-    Performance (TWR/MWR) endpoints do NOT call this — they are always CHF.
+    Performance (TWR/MWR) endpoints do NOT call this — they are base-currency.
     """
     if currency is None or currency.strip() == "":
-        return "CHF"
+        return "USD"
     normalized = currency.strip().upper()
     if normalized not in ALLOWED_DISPLAY_CURRENCIES:
         raise HTTPException(
@@ -1171,13 +1172,14 @@ async def get_public_dashboard(
             portfolio,
         )
 
-        # Performance stays canonical CHF (TWR/MWR are currency-independent by
-        # design). Tag it explicitly so the frontend labels it "Performance in
-        # CHF" regardless of the active display currency.
+        # Performance (TWR/MWR) is expressed in the portfolio's base_currency
+        # and is currency-independent by design. Tag it with the actual base so
+        # the frontend labels it correctly regardless of the active display
+        # currency (was hard-coded "CHF"; that mislabeled the USD portfolios).
         performance = None
         if performance_row:
             performance = dict(performance_row)
-            performance["currency"] = "CHF"
+            performance["currency"] = performance.get("base_currency")
 
         return JSONResponse(
             content=json_safe(
@@ -4015,6 +4017,9 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
         # CNY = onshore yuan (China mainland). open.er-api also exposes CNH
         # (offshore); we deliberately use onshore CNY as the display currency.
         usd_cny = parse_decimal(rates.get("CNY"), None)
+        # HKD: a booked native currency (0009). Needed as a native->USD (base)
+        # source going forward; also added as a display option cross.
+        usd_hkd = parse_decimal(rates.get("HKD"), None)
 
         if not usd_chf:
             raise RuntimeError("USDCHF rate missing from FX API")
@@ -4058,6 +4063,8 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
             # CHF->EUR fiat cross (only when usd_eur is present)
             chf_eur = usd_eur / usd_chf
             rows.append(("CHF", "EUR", chf_eur, "open_er_api_chf_cross"))
+            # EUR->USD inverse: native->base(USD) source (base flip 0009)
+            rows.append(("EUR", "USD", 1.0 / usd_eur, "open_er_api_inv"))
 
         if usd_gbp:
             rows.append(("USD",  "GBP", usd_gbp, "open_er_api"))
@@ -4067,6 +4074,8 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
             # CHF->GBP fiat cross (was previously missing — toggle needs it)
             chf_gbp = usd_gbp / usd_chf
             rows.append(("CHF", "GBP", chf_gbp, "open_er_api_chf_cross"))
+            # GBP->USD inverse: native->base(USD) source
+            rows.append(("GBP", "USD", 1.0 / usd_gbp, "open_er_api_inv"))
 
         if usd_jpy:
             # JPY is a large-magnitude rate (1 USD ~= 160 JPY); the cross
@@ -4079,6 +4088,8 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
             rows.append(("JPY",  "JPY", 1, "system"))
             chf_jpy = usd_jpy / usd_chf
             rows.append(("CHF", "JPY", chf_jpy, "open_er_api_chf_cross"))
+            # JPY->USD inverse: native->base(USD) source
+            rows.append(("JPY", "USD", 1.0 / usd_jpy, "open_er_api_inv"))
 
         if usd_cny:
             # Onshore yuan (CNY). CHF->CNY ~= 8.4.
@@ -4088,6 +4099,20 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
             rows.append(("CNY",  "CNY", 1, "system"))
             chf_cny = usd_cny / usd_chf
             rows.append(("CHF", "CNY", chf_cny, "open_er_api_chf_cross"))
+            # CNY->USD inverse: native->base(USD) source. Also covers the CNH
+            # test trade approximated as CNY (0009 cnh_as_cny).
+            rows.append(("CNY", "USD", 1.0 / usd_cny, "open_er_api_inv"))
+
+        if usd_hkd:
+            # HKD: booked native currency (0009). USD->HKD (display) + HKD->USD
+            # (native->base source) + self + CHF cross. HKD is ~USD-pegged (~7.8).
+            rows.append(("USD",  "HKD", usd_hkd, "open_er_api"))
+            rows.append(("USDT", "HKD", usd_hkd, "open_er_api_usdt_as_usd"))
+            rows.append(("USDC", "HKD", usd_hkd, "open_er_api_usdc_as_usd"))
+            rows.append(("HKD",  "HKD", 1, "system"))
+            chf_hkd = usd_hkd / usd_chf
+            rows.append(("CHF", "HKD", chf_hkd, "open_er_api_chf_cross"))
+            rows.append(("HKD", "USD", 1.0 / usd_hkd, "open_er_api_inv"))
 
         # --- Anti-bug check (parity-SAFE) ----------------------------------
         #   The past bug class was a stablecoin/fiat pair silently collapsing to
