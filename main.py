@@ -56,6 +56,29 @@ app.add_middleware(
 )
 
 
+# ---- /public/* access gate: shared API key (staged, fail-open when unset) ----
+# Mirrors require_admin_token's convention: if PUBLIC_API_KEY is NOT set the gate
+# is OPEN, so deploying this code changes nothing until the key is configured.
+# Once PUBLIC_API_KEY is set in the environment, every /public/* request must
+# carry a matching `x-api-key` header (constant-time compared). OPTIONS (CORS
+# preflight) is always allowed; the 401 carries an Access-Control-Allow-Origin
+# header so a browser client can still read the rejection.
+@app.middleware("http")
+async def public_api_key_gate(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/public/") and request.method != "OPTIONS":
+        expected = os.getenv("PUBLIC_API_KEY")
+        if expected:  # gate is active ONLY when a key is configured
+            provided = request.headers.get("x-api-key") or ""
+            if not hmac.compare_digest(provided, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "Unauthorized: missing or invalid x-api-key."},
+                    headers={"Access-Control-Allow-Origin": "*"},
+                )
+    return await call_next(request)
+
+
 # -------------------------
 # Helpers
 # -------------------------
