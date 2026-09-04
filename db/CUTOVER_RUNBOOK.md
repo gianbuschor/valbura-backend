@@ -28,27 +28,41 @@ Weil Phase 1 gegen **echte, aber leere** Konten läuft, sind die Wallets (USDT-M
 ### Scope-Deltas gegenüber den Phase-1-Schritten
 
 **Schritt 1 (Vorher-Bild) — pro PORTFOLIO statt nur pro Broker:**
+> **ACHTUNG `import_jobs`:** dort ist `portfolio_id` **immer NULL** (`start_import_job` schreibt nur `portfolio_name`). Diese Tabelle wird daher über **`portfolio_name`** aufgelöst, die anderen 6 über `portfolio_id`.
 ```sql
-SELECT s.tbl, COALESCE(p.name,'(kein Portfolio)') AS portfolio, s.broker, s.n FROM (
-  SELECT 'trades' tbl, portfolio_id, broker, count(*) n FROM trades GROUP BY portfolio_id, broker
-  UNION ALL SELECT 'portfolio_cashflows', portfolio_id, broker, count(*) FROM portfolio_cashflows GROUP BY portfolio_id, broker
-  UNION ALL SELECT 'realized_pnl_events', portfolio_id, broker, count(*) FROM realized_pnl_events GROUP BY portfolio_id, broker
-  UNION ALL SELECT 'portfolio_nav_snapshots', portfolio_id, broker, count(*) FROM portfolio_nav_snapshots GROUP BY portfolio_id, broker
-  UNION ALL SELECT 'positions', portfolio_id, broker, count(*) FROM positions GROUP BY portfolio_id, broker
-  UNION ALL SELECT 'portfolio_cash', portfolio_id, broker, count(*) FROM portfolio_cash GROUP BY portfolio_id, broker
-  UNION ALL SELECT 'import_jobs', portfolio_id, broker, count(*) FROM import_jobs GROUP BY portfolio_id, broker
-) s LEFT JOIN portfolios p ON p.id = s.portfolio_id
-ORDER BY s.tbl, portfolio, s.broker;
+SELECT tbl, portfolio, broker, n FROM (
+  -- 6 Tabellen über portfolio_id (-> Portfolio-Name via Join)
+  SELECT s.tbl, COALESCE(p.name,'(kein Portfolio)') AS portfolio, s.broker, s.n
+  FROM (
+    SELECT 'trades' tbl, portfolio_id, broker, count(*) n FROM trades GROUP BY portfolio_id, broker
+    UNION ALL SELECT 'portfolio_cashflows', portfolio_id, broker, count(*) FROM portfolio_cashflows GROUP BY portfolio_id, broker
+    UNION ALL SELECT 'realized_pnl_events', portfolio_id, broker, count(*) FROM realized_pnl_events GROUP BY portfolio_id, broker
+    UNION ALL SELECT 'portfolio_nav_snapshots', portfolio_id, broker, count(*) FROM portfolio_nav_snapshots GROUP BY portfolio_id, broker
+    UNION ALL SELECT 'positions', portfolio_id, broker, count(*) FROM positions GROUP BY portfolio_id, broker
+    UNION ALL SELECT 'portfolio_cash', portfolio_id, broker, count(*) FROM portfolio_cash GROUP BY portfolio_id, broker
+  ) s LEFT JOIN portfolios p ON p.id = s.portfolio_id
+  UNION ALL
+  -- import_jobs über portfolio_name (portfolio_id ist hier immer NULL)
+  SELECT 'import_jobs', COALESCE(portfolio_name,'(kein Portfolio)'), broker, count(*)
+    FROM import_jobs GROUP BY portfolio_name, broker
+) x
+ORDER BY tbl, portfolio, broker;
 ```
 - [ ] **Global**-Zeilen (Bitget/IBKR) notieren (→ werden 0). **Alternatives-** und **MT5**-Zahlen notieren (→ müssen **unverändert** bleiben).
 
 **Schritt 2 (Backup) — nur Global-Zeilen, Suffix `20260904`:**
 ```sql
+-- 6 Tabellen über portfolio_id:
 CREATE TABLE _bkp_trades_20260904 AS
   SELECT * FROM trades WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
--- identisch für: portfolio_cashflows, realized_pnl_events, portfolio_nav_snapshots, positions, portfolio_cash, import_jobs
+-- identisch für: portfolio_cashflows, realized_pnl_events, portfolio_nav_snapshots, positions, portfolio_cash
+
+-- import_jobs über portfolio_name (portfolio_id ist hier immer NULL!):
+CREATE TABLE _bkp_import_jobs_20260904 AS
+  SELECT * FROM import_jobs WHERE broker IN ('Bitget','IBKR') AND portfolio_name = 'Global';
 ```
-- [ ] Für jede Backup-Tabelle: `count(_bkp_*)` == `count(Original WHERE broker IN ('Bitget','IBKR') AND portfolio_id = Global)`.
+- [ ] Für die 6 portfolio_id-Tabellen: `count(_bkp_*)` == `count(Original WHERE broker IN ('Bitget','IBKR') AND portfolio_id = Global)`.
+- [ ] Für `import_jobs`: `count(_bkp_import_jobs_20260904)` == `count(import_jobs WHERE broker IN ('Bitget','IBKR') AND portfolio_name = 'Global')` (> 0, im Gegensatz zum ersten Versuch mit portfolio_id).
 
 **Schritt 3 (DELETE) — Portfolio-Filter zwingend (sonst träfe der Broker-Filter Global UND Alternatives):**
 ```sql
@@ -58,7 +72,7 @@ DELETE FROM positions               WHERE broker IN ('Bitget','IBKR') AND portfo
 DELETE FROM portfolio_nav_snapshots WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
 DELETE FROM portfolio_cash          WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
 DELETE FROM portfolio_cashflows     WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
-DELETE FROM import_jobs             WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
+DELETE FROM import_jobs             WHERE broker IN ('Bitget','IBKR') AND portfolio_name = 'Global';  -- portfolio_id ist hier immer NULL!
 DELETE FROM trades                  WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
 -- Verifikation VOR COMMIT; erst bei grün: COMMIT; sonst ROLLBACK;
 COMMIT;
