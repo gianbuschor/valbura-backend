@@ -2276,7 +2276,11 @@ async def _start_ibkr_sync(x_admin_token: Optional[str]):
         return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
 
     global_query = os.getenv("IBKR_ACTIVITY_QUERY_ID_GLOBAL")
-    alternatives_query = os.getenv("IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES") or global_query
+    # NO silent fallback: Alternatives must NEVER borrow the Global query. Since
+    # IBKR_ACTIVITY_QUERY_ID_GLOBAL points at a REAL account, `... or global_query`
+    # would mirror real Global trades into the Alternatives portfolio. A missing
+    # per-portfolio query instead hard-fails ONLY that portfolio (in the loop below).
+    alternatives_query = os.getenv("IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES")
     if not global_query:
         return JSONResponse(
             content={"status": "failed", "broker": "IBKR",
@@ -2324,6 +2328,28 @@ async def _start_ibkr_sync(x_admin_token: Optional[str]):
                 # Create both jobs INSIDE the locked transaction so their ids ride
                 # along in the 202 and a concurrent caller sees them.
                 for portfolio_name, query_id in portfolios:
+                    if not query_id:
+                        # Hard-fail THIS portfolio — never borrow another
+                        # portfolio's query (no silent fallback / no mirror).
+                        failed_id = await start_import_job(
+                            conn, "IBKR", portfolio_name, {"query_id": None},
+                        )
+                        await finish_import_job(
+                            conn, failed_id, "failed",
+                            error_message=(
+                                f"IBKR_ACTIVITY_QUERY_ID_{portfolio_name.upper()} not set "
+                                "— skipped (no silent fallback to another portfolio's query)"
+                            ),
+                        )
+                        jobs.append({
+                            "job_id": failed_id,
+                            "broker": "IBKR",
+                            "portfolio": portfolio_name,
+                            "query_id": None,
+                            "status": "failed",
+                            "poll_url": f"/sync/status/{failed_id}",
+                        })
+                        continue
                     job_id = await start_import_job(
                         conn,
                         "IBKR",

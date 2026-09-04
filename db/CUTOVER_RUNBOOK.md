@@ -15,6 +15,78 @@ Weil Phase 1 gegen **echte, aber leere** Konten läuft, sind die Wallets (USDT-M
 
 ---
 
+## Phase 1a — GLOBAL-ONLY-Cutover (Scope-Override, 02.09.2026)
+
+> **Kontext-Update (aktuell):** Geld liegt bereits auf dem **echten IBKR-Global-Konto**; Bitget-Global bleibt vorerst leer bis zum ersten Kauf (erster echter Trade in den nächsten Tagen). **Für die nächsten 1–2 Monate liegt der Fokus NUR auf Global.** **Alternatives** und **Day Trading** (MT5, läuft ohnehin schon) folgen **später**.
+>
+> **Dieser Abschnitt ändert NUR den SCOPE der Schritte 1–6.** Die Schritte selbst (unten, Phase 1) bleiben inhaltlich gültig — sie werden hier auf **Portfolio = Global** eingeschränkt. **Alternatives-Testdaten bleiben stehen**, bis Alternatives seinen eigenen Cutover bekommt.
+
+**Bereits erledigt / relevant für diesen Scope:**
+- **base_currency** ist per Migration **0009 bereits für BEIDE** Portfolios auf **USD** geflippt (+ 0010 Cashflow-Rebase). Für Global-only unkritisch — im Gegenteil: Alternatives ist bereits USD, sein späterer Cutover **überspringt den Base-Flip**. Der echte Global-Ingest rechnet `amount_base` unter base=USD korrekt (0009-Backfills + FX-Sync `X→USD`).
+- **IBKR-Fallback-Falle gehärtet** (Code): der stille `IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES or global_query`-Fallback ist entfernt — eine fehlende Alternatives-Query lässt jetzt **nur Alternatives** hart fehlschlagen (`import_jobs.status='failed'`), spiegelt **niemals** die (echte) Global-Query. Siehe Schritt 5.
+
+### Scope-Deltas gegenüber den Phase-1-Schritten
+
+**Schritt 1 (Vorher-Bild) — pro PORTFOLIO statt nur pro Broker:**
+```sql
+SELECT s.tbl, COALESCE(p.name,'(kein Portfolio)') AS portfolio, s.broker, s.n FROM (
+  SELECT 'trades' tbl, portfolio_id, broker, count(*) n FROM trades GROUP BY portfolio_id, broker
+  UNION ALL SELECT 'portfolio_cashflows', portfolio_id, broker, count(*) FROM portfolio_cashflows GROUP BY portfolio_id, broker
+  UNION ALL SELECT 'realized_pnl_events', portfolio_id, broker, count(*) FROM realized_pnl_events GROUP BY portfolio_id, broker
+  UNION ALL SELECT 'portfolio_nav_snapshots', portfolio_id, broker, count(*) FROM portfolio_nav_snapshots GROUP BY portfolio_id, broker
+  UNION ALL SELECT 'positions', portfolio_id, broker, count(*) FROM positions GROUP BY portfolio_id, broker
+  UNION ALL SELECT 'portfolio_cash', portfolio_id, broker, count(*) FROM portfolio_cash GROUP BY portfolio_id, broker
+  UNION ALL SELECT 'import_jobs', portfolio_id, broker, count(*) FROM import_jobs GROUP BY portfolio_id, broker
+) s LEFT JOIN portfolios p ON p.id = s.portfolio_id
+ORDER BY s.tbl, portfolio, s.broker;
+```
+- [ ] **Global**-Zeilen (Bitget/IBKR) notieren (→ werden 0). **Alternatives-** und **MT5**-Zahlen notieren (→ müssen **unverändert** bleiben).
+
+**Schritt 2 (Backup) — nur Global-Zeilen, Suffix `20260904`:**
+```sql
+CREATE TABLE _bkp_trades_20260904 AS
+  SELECT * FROM trades WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
+-- identisch für: portfolio_cashflows, realized_pnl_events, portfolio_nav_snapshots, positions, portfolio_cash, import_jobs
+```
+- [ ] Für jede Backup-Tabelle: `count(_bkp_*)` == `count(Original WHERE broker IN ('Bitget','IBKR') AND portfolio_id = Global)`.
+
+**Schritt 3 (DELETE) — Portfolio-Filter zwingend (sonst träfe der Broker-Filter Global UND Alternatives):**
+```sql
+BEGIN;
+DELETE FROM realized_pnl_events     WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
+DELETE FROM positions               WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
+DELETE FROM portfolio_nav_snapshots WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
+DELETE FROM portfolio_cash          WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
+DELETE FROM portfolio_cashflows     WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
+DELETE FROM import_jobs             WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
+DELETE FROM trades                  WHERE broker IN ('Bitget','IBKR') AND portfolio_id = (SELECT id FROM portfolios WHERE name='Global');
+-- Verifikation VOR COMMIT; erst bei grün: COMMIT; sonst ROLLBACK;
+COMMIT;
+```
+Verifikation (nutzt dieselbe Pro-Portfolio-Query wie Schritt 1):
+- [ ] **Global** Bitget+IBKR == **0** in allen 7 Tabellen.
+- [ ] **Alternatives** Bitget+IBKR **exakt unverändert** vs. Vorher-Bild (dies ist der neue, kritische Zusatz-Check).
+- [ ] **MT5** unverändert.
+Rollback (Schritt 3) analog, aber mit den `_bkp_*_20260904`-Tabellen (nur Global).
+
+**Schritt 4 (ENV) — nur Global auf echt, Alternatives KOMPLETT unangetastet:**
+- [ ] Echt setzen: `BITGET_GLOBAL_API_KEY`/`_SECRET`/`_PASSPHRASE`, `IBKR_ACTIVITY_QUERY_ID_GLOBAL`, `IBKR_FLEX_TOKEN`. *(Laut Schritt 0.1/0.2 evtl. schon echt — erst aktuelle Railway-Werte prüfen.)*
+- [ ] **Unangetastet lassen:** alle `BITGET_ALTERNATIVES_*`, `IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES`, `MT5_INGEST_TOKEN`.
+- **Fallstricke einseitiger Umstellung:**
+  - Beide Sync-Loops (`/sync/bitget`, `/sync/ibkr`) verarbeiten **weiterhin beide** Portfolios. Global→echt, Alternatives→Test-Creds. Gewollt; Alternatives-Bitget-Sync gegen alten Testkey kann `40009`/Fehler liefern = **harmlos, geloggt**, kein Global-Einfluss.
+  - `get_bitget_creds` hat **keinen** Fallback → **leere** `BITGET_ALTERNATIVES_*` würden Alternatives-Bitget-Jobs **hart** fehlschlagen lassen (kein Mirror). → gesetzt lassen.
+  - `/debug/verify/separation` vergleicht dann **echt-Global vs. test-Alternatives** — `accounts_differ`/`spot_user_differs` = true, aber das ist **nicht** der finale Zwei-Konten-Trennungsbeweis (der kommt beim Alternatives-Cutover). Nicht überinterpretieren.
+
+**Schritt 5 (IBKR-Fallback) — jetzt durch Code abgesichert, ENV-Regel bleibt:**
+- [ ] `IBKR_ACTIVITY_QUERY_ID_ALTERNATIVES` bleibt **explizit gesetzt** (Test-Wert) und **≠** Global. Seit der Härtung würde ein leerer Wert Alternatives ohnehin **hart** fehlschlagen statt die echte Global-Query zu ziehen — aber gesetzt lassen ist der saubere Zustand (Alternatives synct weiter Testdaten).
+
+**Schritte 6–9:** unverändert, mit der Maßgabe **„Alternatives ignorieren"**: dessen Sync-Fehler (`failed`-Jobs / Testdaten) sind in dieser Phase **erwartet** und **kein** Blocker. Die STOPP-Checks gelten nur für **Global**.
+
+### Wann Phase 1a „fertig" ist
+Global synct echt und fehlerfrei (IBKR mit echtem Geld; Bitget-Global leer bis zum ersten Kauf), Global-Testdaten sind ersetzt, Alternatives/Day-Trading unberührt. Der Alternatives-Cutover ist später ein **eigener** Lauf dieses Abschnitts mit `name='Alternatives'` — **ohne** erneuten Base-Flip (0009 hat ihn schon erledigt).
+
+---
+
 ## Timing & aktueller Stand (verbindlich)
 
 **Schritt 0 (Vorbedingungen) ist KOMPLETT ABGEHAKT** — siehe abgehakte Liste in Schritt 0. Beide Broker sind **verifiziert getrennt**, der IBKR-Hard-Fail-Fix ist deployed, der Composite-NAV ist gebaut und am echten (leeren) Konto mechanisch verifiziert, und die echten ENV-Variablen sind in Railway gesetzt.
