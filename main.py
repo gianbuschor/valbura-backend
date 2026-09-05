@@ -232,6 +232,33 @@ async def sweep_stale_import_jobs(conn) -> int:
         return 0
 
 
+async def prune_old_import_jobs(conn, keep_days: int = 30) -> int:
+    """Delete finished 'success' import_jobs older than keep_days (housekeeping).
+
+    High-frequency syncs (e.g. Bitget every 10 min) create ~2 import_jobs rows
+    per run; over time that grows unbounded. This removes only 'success' rows
+    past the retention window — recent rows and any 'failed'/'started' rows are
+    kept ('failed' are far fewer and useful for debugging; 'started' are handled
+    by sweep_stale_import_jobs). Idempotent; returns the number of rows deleted.
+    Called once per day from the FX sync (the only once-daily job), so no extra
+    cron is needed.
+    """
+    result = await conn.execute(
+        """
+        DELETE FROM public.import_jobs
+        WHERE status = 'success'
+          AND finished_at IS NOT NULL
+          AND finished_at < now() - make_interval(days => $1)
+        """,
+        keep_days,
+    )
+    # asyncpg returns a tag like "DELETE 42"; parse the count defensively.
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return 0
+
+
 async def log_sync_error(conn, broker: str, portfolio_name: Optional[str], error_message: str, raw_payload: Optional[dict] = None):
     await conn.execute(
         """
@@ -4310,6 +4337,16 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
             job_status = "success"
             err_msg = None
 
+        # Daily housekeeping: prune old finished import_jobs so high-frequency
+        # syncs (Bitget every 10 min) don't grow the table unbounded. Runs here
+        # because the FX sync is the once-daily job. A prune failure must NEVER
+        # affect the FX outcome, so it is isolated.
+        try:
+            import_jobs_pruned = await prune_old_import_jobs(conn, keep_days=30)
+        except Exception as _prune_err:
+            import_jobs_pruned = 0
+            print(f"[fx] import_jobs prune failed (ignored): {_prune_err}")
+
         if job_id:
             await finish_import_job(
                 conn, job_id,
@@ -4324,6 +4361,7 @@ async def sync_fx_rates(x_admin_token: Optional[str] = Header(None)):
                     "usd_gbp": usd_gbp,
                     "rows_upserted": len(rows),
                     "warnings": fx_warnings,
+                    "import_jobs_pruned": import_jobs_pruned,
                 },
             )
 
