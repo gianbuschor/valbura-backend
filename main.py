@@ -1629,23 +1629,27 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
 
     market_value = nav - cash
 
-    # --- IBKR cashflow from CashReportCurrency BASE_SUMMARY ---
-    # In many Flex reports this is YTD/cumulative. Therefore:
-    # - first import stores the current cumulative value as initial cashflow at fromDate
-    # - later imports store only the delta versus the last imported cumulative value
+    # --- IBKR capital flow from ChangeInNAV.depositsWithdrawals ---
+    # ChangeInNAV.depositsWithdrawals is the aggregate NAV-changing capital flow:
+    # it INCLUDES external deposits/withdrawals AND internal account transfers
+    # (e.g. funding Global from another IBKR account), while EXCLUDING investment
+    # return, interest, dividends and fees (those are separate ChangeInNAV fields).
+    # We previously read CashReportCurrency.depositWithdrawals, which counts only
+    # EXTERNAL cash deposits and reads 0 for an internal transfer (that lands in
+    # CashReport.accountTransfers instead) -> the initial inter-account funding was
+    # missed. ChangeInNAV is the correct, complete, future-proof source (covers
+    # both funding methods). Still YTD/cumulative -> same delta mechanism below.
     ibkr_cashflow = None
 
     for elem in root.iter():
-        if elem.tag.lower().endswith("cashreportcurrency"):
+        if elem.tag.lower().endswith("changeinnav"):
             data = elem.attrib
-            cash_currency = data.get("currency")
-
-            if cash_currency != "BASE_SUMMARY":
-                continue
 
             from_date_raw = data.get("fromDate")
             to_date_raw = data.get("toDate")
-            deposit_withdrawals = parse_decimal(data.get("depositWithdrawals"), 0)
+            # NOTE: ChangeInNAV spells it 'depositsWithdrawals' (with the 's'),
+            # unlike CashReportCurrency's 'depositWithdrawals'.
+            deposit_withdrawals = parse_decimal(data.get("depositsWithdrawals"), 0)
 
             if not to_date_raw:
                 continue
@@ -1785,7 +1789,7 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             cash,
         )
 
-        # Import IBKR cashflow delta from YTD CashReportCurrency BASE_SUMMARY.
+        # Import IBKR cashflow delta from the YTD ChangeInNAV.depositsWithdrawals.
         if ibkr_cashflow is not None:
             previous_cashflow = await conn.fetchrow(
                 """
