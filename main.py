@@ -348,6 +348,25 @@ async def get_fx_rate(
     return None
 
 
+async def fx_native_to_base(conn, from_currency: str, base_currency: str, rate_date) -> Optional[float]:
+    """native -> base_currency, with the CHF-bridge fallback (same rule as migration 0010).
+
+    Prefers a direct from->base rate (get_fx_rate handles from==base -> 1.0 and
+    date carry-forward). If none exists (e.g. CHF->USD before the direct cross
+    series began 2026-06-17), derives it via CHF: (from->CHF) / (base->CHF),
+    backed by the full USD->CHF history. Returns None only if the bridge legs are
+    also absent — the caller then stores NULL, never a wrong native-valued base.
+    """
+    direct = await get_fx_rate(conn, from_currency, base_currency, rate_date)
+    if direct is not None:
+        return direct
+    num = await get_fx_rate(conn, from_currency, "CHF", rate_date)
+    den = await get_fx_rate(conn, base_currency, "CHF", rate_date)
+    if num is not None and den:
+        return num / den
+    return None
+
+
 # -------------------------
 # Display-currency toggle (Block 2, step 4)
 # -------------------------
@@ -1535,6 +1554,10 @@ async def upsert_ibkr_trades(conn, portfolio_name: str, report_text: str):
 
 async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text: str):
     portfolio_id = await get_portfolio_id(conn, portfolio_name)
+    # base_currency drives the native->base conversion of the cashflow below.
+    base_currency = await conn.fetchval(
+        "SELECT base_currency FROM public.portfolios WHERE id = $1", portfolio_id
+    ) or "USD"
 
     report_text_stripped = xml_text.strip()
     if not report_text_stripped.startswith("<"):
@@ -1780,12 +1803,24 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             if cashflow_delta != 0:
                 external_id = f"IBKR:{portfolio_name}:cash_report_ytd_delta:{cashflow_date.isoformat()}"
 
+                # Convert native -> base at the cashflow date (CHF-bridge fallback,
+                # same rule as migration 0010). Previously amount_base was stored as
+                # the NATIVE delta (amount_base = amount_native), which under a USD
+                # base understates net_contributions/MWR by the whole FX factor.
+                # None (no rate even via bridge) -> store NULL, never a wrong value.
+                fx_to_base = await fx_native_to_base(conn, currency, base_currency, cashflow_date)
+                amount_base = (
+                    cashflow_delta * Decimal(str(fx_to_base)) if fx_to_base is not None else None
+                )
+
                 raw_payload = {
                     "from_date": ibkr_cashflow["from_date"].isoformat(),
                     "to_date": ibkr_cashflow["to_date"].isoformat(),
                     "current_ytd_deposit_withdrawals": str(current_ytd),
                     "previous_ytd_deposit_withdrawals": str(previous_ytd),
                     "cashflow_delta": str(cashflow_delta),
+                    "fx_native_to_base": str(fx_to_base) if fx_to_base is not None else None,
+                    "base_currency": base_currency,
                     "cash_report": ibkr_cashflow["raw_payload"],
                 }
 
@@ -1799,10 +1834,10 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
                     )
                     VALUES (
                         $1, 'IBKR', $2, $3,
-                        $4, $4,
+                        $4, $5,
                         'NET_DEPOSIT_WITHDRAWAL',
                         'ibkr_cash_report_ytd_delta',
-                        $5, $6::jsonb,
+                        $6, $7::jsonb,
                         now()
                     )
                     ON CONFLICT (portfolio_id, broker, source, external_id)
@@ -1819,12 +1854,13 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
                     cashflow_date,
                     currency,
                     cashflow_delta,
+                    amount_base,
                     external_id,
                     json.dumps(raw_payload),
                 )
 
                 cashflow_imported = True
-                cashflow_amount_base = cashflow_delta
+                cashflow_amount_base = amount_base
 
         # Replace only this portfolio's IBKR positions after parsing succeeded.
         await conn.execute(
