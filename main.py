@@ -1829,7 +1829,14 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
             else:
                 previous_ytd = 0
                 cashflow_delta = current_ytd
-                cashflow_date = ibkr_cashflow["from_date"]
+                # First import: date at to_date (report/detection date), NOT
+                # from_date. from_date is the YTD-query PERIOD START (e.g. Jan 1),
+                # which is not a real event date — it made the initial capital
+                # flow land on 2026-01-01. to_date (≈ detection date) matches the
+                # delta branch above and, with regular syncing, is within ~1 day
+                # of the real event. (Exact per-event dating would require parsing
+                # individual Transfer/CashTransaction records — deferred.)
+                cashflow_date = ibkr_cashflow["to_date"]
 
             if cashflow_delta != 0:
                 external_id = f"IBKR:{portfolio_name}:cash_report_ytd_delta:{cashflow_date.isoformat()}"
