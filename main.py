@@ -1840,8 +1840,11 @@ async def upsert_ibkr_snapshot_and_positions(conn, portfolio_name: str, xml_text
                 # base understates net_contributions/MWR by the whole FX factor.
                 # None (no rate even via bridge) -> store NULL, never a wrong value.
                 fx_to_base = await fx_native_to_base(conn, currency, base_currency, cashflow_date)
+                # Both operands are float here: parse_decimal() returns float and
+                # get_fx_rate() returns float. Plain float*float — do NOT wrap fx in
+                # Decimal (cashflow_delta is a float, so that raised float*Decimal).
                 amount_base = (
-                    cashflow_delta * Decimal(str(fx_to_base)) if fx_to_base is not None else None
+                    cashflow_delta * fx_to_base if fx_to_base is not None else None
                 )
 
                 raw_payload = {
